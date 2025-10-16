@@ -1,93 +1,39 @@
 import gymnasium as gym
 import numpy as np
-from gymnasium import spaces
 
-class EnvWrapper(gym.Wrapper):
+def main():
+    env = gym.make("CarRacing-v3", render_mode="human")
 
-    def __init__(self, render_mode=None):
-        env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=False)
-        super().__init__(env)
+    try:
+        obs, info = env.reset(seed=0)
+        ep = 1
+        ep_return, ep_steps = 0.0, 0
 
-        # Action space
-        # Base Env: Discrete(5) 
-        # add action 5 for pit
-        self.action_space = spaces.Discrete(6)
+        while True:
+            # random agent
+            action = env.action_space.sample()
 
-        # State space
-        self.observation_space = self.env.observation_space
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_return += float(reward)
+            ep_steps += 1
 
-        self.fuel = 1.0
-        self.tire = 1.0
-        self.total_tiles = 1000
-        self.tiles_visited = 0
+            # Episode end conditions per Gymnasium API
+            if terminated or truncated:
+                reason = (
+                    "terminated" if terminated and not truncated
+                    else ("truncated" if not info.get("TimeLimit.truncated", False)
+                          else "truncated by TimeLimit")
+                )
+                print(f"[DONE] Episode {ep} | steps={ep_steps} | return={ep_return:.2f} | reason={reason}")
+                # Start next episode
+                ep += 1
+                ep_return, ep_steps = 0.0, 0
+                obs, info = env.reset()
 
-    def reset(self, seed=None, options=None):
-        obs, info = self.env.reset(seed=seed, options=options)
-        self.fuel = 1.0
-        self.tire = 1.0
-        self.tiles_visited = 0
-        return obs, info
-    
-    def step(self, action):
-        terminated, truncated = False, False
-        pit = False
-        step_bonus = 0.0
-
-        # Transition dynamic
-        if action == 5:  # pit
-            pit = True
-            self.fuel = 1.0
-            self.tire = 1.0
-            reward = 5.0  # small reward to use pit 
-            obs = np.zeros_like(self.env.observation_space.sample())
-            info = {"pit_stop": True}
-        else:
-            # normal driving
-            obs, base_reward, terminated, truncated, info = self.env.step(action)
-            
-            self.fuel = max(0.0, self.fuel - 0.001)
-            self.tire = max(0.0, self.tire - 0.001)
-            self.tiles_visited += info.get("tile_visited", 1)
-
-            # Reward structure
-            # Base reward from Gym
-            reward = max(0.0, base_reward)
-
-            progres = (1000 / self.total_tiles) * info.get("tile_visited", 1)
-
-            # reward for good condition
-            fuel = self.fuel * 0.5
-            tire = self.tire * 0.5
-
-            # small reward for keep moving
-            step_bonus = 0.1
-
-            reward = reward + progres + fuel + tire + step_bonus
-
-            if info.get("lap_complete", False):
-                reward += 100.0  # Reward for finishing lap
-
-        info.update({
-            "fuel": self.fuel,
-            "tire": self.tire,
-            "pit_stop": pit
-        })
-        return obs, reward, terminated, truncated, info
-
-    def render(self):
-        return self.env.render()
+    finally:
+        env.close()
 
 if __name__ == "__main__":
-    env = EnvWrapper(render_mode="human")
-    obs, info = env.reset()
-    done = False
-    ep_reward = 0
+    main()
 
-    while not done:
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        ep_reward += reward
-        done = terminated or truncated
 
-    print(f"Reward: {ep_reward:.2f}")
-    env.close()
