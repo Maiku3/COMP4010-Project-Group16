@@ -104,7 +104,7 @@ class CarRacing(gym.Env):
 
         # Get speed from box2d
         velocity = np.linalg.norm(self._env.unwrapped.car.hull.linearVelocity)
-        print(f"Velocity: {velocity:.2f} | Fuel: {self._fuel:.3f} | Wear: {self._wear:.3f}")
+        # print(f"Velocity: {velocity:.2f} | Fuel: {self._fuel:.3f} | Wear: {self._wear:.3f}")
 
         # Update resources
         steer, gas, brake = float(base_action[0]), float(base_action[1]), float(base_action[2])
