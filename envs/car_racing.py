@@ -29,25 +29,12 @@ class CarRacing(gym.Env):
         # State S_t
         image_space = spaces.Box(0, 255, shape=(96, 96, 3), dtype=np.uint8)
 
-        # state branch: [d_t, v_t, infield, pitroad, ell_t, w_t, f_t, kappa_t, progress]
-        state_low  = np.array([-5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05, 0.0], dtype=np.float32)
-        state_high = np.array([ 5.0, 70.0, 1.0, 1.0, 1.0, 1.0, 1.0,  0.05, 1.0], dtype=np.float32)
+        # state branch: [d_t, v_t, infield, pitroad, ell_t, w_t, f_t, kappa_t]
+        state_low  = np.array([-5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05], dtype=np.float32)
+        state_high = np.array([ 5.0, 70.0, 1.0, 1.0, 1.0, 1.0, 1.0,  0.05], dtype=np.float32)
         state_space = spaces.Box(low=state_low, high=state_high, dtype=np.float32)
 
         self.observation_space = spaces.Dict({"image": image_space, "state": state_space})
-
-        # self.observation_space = spaces.Dict({
-        #             "image": spaces.Box(0, 255, shape=(96, 96, 3), dtype=np.uint8),
-        #             "d_t": spaces.Box(-5.0, 5.0, shape=(1,), dtype=np.float32),
-        #             "v_t": spaces.Box(0.0, 70.0, shape=(1,), dtype=np.float32),
-        #             "infield": spaces.Discrete(2),
-        #             "pitroad": spaces.Discrete(2),
-        #             "ell_t": spaces.Box(0.0, 1.0, shape=(1,), dtype=np.float32),
-        #             "w_t": spaces.Box(0.0, 1.0, shape=(1,), dtype=np.float32),
-        #             "f_t": spaces.Box(0.0, 1.0, shape=(1,), dtype=np.float32),
-        #             "kappa_t": spaces.Box(-0.05, 0.05, shape=(1,), dtype=np.float32),
-        #             "progress": spaces.Box(np.array([0.0], np.float32), np.array([1.0], np.float32)),
-        #         })
 
         # Action A_t
         if self.continuous:
@@ -192,18 +179,6 @@ class CarRacing(gym.Env):
         ], dtype=np.float32)
 
         return {"image": base_obs, "state": state_vec}
-        # return {
-        #     "image": base_obs,
-        #     "d_t": np.array([0.0], dtype=np.float32),
-        #     "v_t": np.array([0.0], dtype=np.float32),
-        #     "infield": 0,
-        #     "pitroad": 0,
-        #     "ell_t": np.array([0.0], dtype=np.float32),
-        #     "w_t": np.array([self._wear], dtype=np.float32),
-        #     "f_t": np.array([self._fuel], dtype=np.float32),
-        #     "kappa_t": np.array([0.0], dtype=np.float32),
-        #     "progress": np.array([self.progress], dtype=np.float32),
-        # }
     
     def _compute_offset(self):
         # Placeholder implementation
