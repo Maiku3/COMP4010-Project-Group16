@@ -21,6 +21,7 @@ def main():
     while episode <= args.episodes:
         action = env.action_space.sample()
         observation, reward, terminated, truncated, info = env.step(action)
+        print(env._compute_offset())
         episode_return += float(reward)
         episode_steps += 1
 
@@ -37,6 +38,7 @@ def main():
             if episode <= args.episodes:
                 episode_return, episode_steps = 0.0, 0
                 observation, info = env.reset(seed=args.seed)
+                
 
 if __name__ == "__main__":
     main()

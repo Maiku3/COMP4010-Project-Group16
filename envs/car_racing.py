@@ -2,6 +2,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 from gymnasium.wrappers import TimeLimit
+import math
 
 class CarRacing(gym.Env):
 
@@ -90,7 +91,7 @@ class CarRacing(gym.Env):
         observation, reward, terminated, truncated, info = self._env.step(base_action)
 
         # Get speed from box2d
-        velocity = np.linalg.norm(self._env.unwrapped.car.hull.linearVelocity)
+        velocity = self._get_velocity()
         # print(f"Velocity: {velocity:.2f} | Fuel: {self._fuel:.3f} | Wear: {self._wear:.3f}")
 
         # Update resources
@@ -159,7 +160,7 @@ class CarRacing(gym.Env):
 
     def _get_obs(self, base_obs):
         d_t = self._compute_offset()
-        v_t = np.linalg.norm(self._env.unwrapped.car.hull.linearVelocity)
+        v_t = self._get_velocity()
         ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
 
         infield = self._is_infield_from_offset()
@@ -181,10 +182,41 @@ class CarRacing(gym.Env):
         return {"image": base_obs, "state": state_vec}
     
     def _compute_offset(self):
-        # Placeholder implementation
-        # geometry calculations based on the car's position relative to the track's centerline.
-        # For now, return dummy values
-        return 0.0  # d_t (offset)
+        env = self._env.unwrapped
+
+        # Car position in Box2D world coordinates
+        car_position = env.car.hull.position
+        car_x, car_y = float(car_position[0]), float(car_position[1])
+
+        track = env.track
+        if not track or len(track) == 0:
+            return 0.0
+
+        # Find the track tile whose center (x, y) is closest to the car
+        min_distance_squared = float("inf")
+        nearest_tile_index = 0
+        for i, (tile_alpha, tile_beta, tile_center_x, tile_center_y) in enumerate(track): 
+            delta_x = car_x - tile_center_x
+            delta_y = car_y - tile_center_y
+            distance_squared = delta_x * delta_x + delta_y * delta_y
+            if distance_squared < min_distance_squared:
+                min_distance_squared = distance_squared
+                nearest_tile_index = i
+
+        # Get the center and orientation (beta) of that nearest tile
+        _, nearest_tile_beta, nearest_tile_center_x, nearest_tile_center_y = track[nearest_tile_index]
+
+        # Compute vector from centerline point to car
+        vector_to_car_x, vector_to_car_y = car_x - nearest_tile_center_x, car_y - nearest_tile_center_y
+
+        # Road normal is (cos(beta), sin(beta)) as used in gym's create_track()
+        # It is a vector that points sideways, perpendicular to the direction you are driving
+        road_normal_x, road_normal_y = math.cos(nearest_tile_beta), math.sin(nearest_tile_beta)
+
+        # Signed lateral offset = projection of w onto the normal, 
+        signed_distance = (vector_to_car_x * road_normal_x + vector_to_car_y * road_normal_y)
+
+        return float(np.clip(signed_distance, -5.0, 5.0))
 
     def _compute_lookahead_curvature(self):
         # Placeholder implementation
@@ -198,6 +230,9 @@ class CarRacing(gym.Env):
         # Placeholder implementation
         return False
 
+    def _get_velocity(self):
+        v_t = self._env.unwrapped.car.hull.linearVelocity
+        return np.linalg.norm(v_t)
     
     # TODO: Implement pitstop rendering
 
