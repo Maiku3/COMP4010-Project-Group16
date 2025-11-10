@@ -3,6 +3,8 @@ import numpy as np
 from gymnasium import spaces
 from gymnasium.wrappers import TimeLimit
 import math
+import pyglet
+from pyglet import shapes
 
 class CarRacing(gym.Env):
 
@@ -70,6 +72,8 @@ class CarRacing(gym.Env):
         self.progress = 0.0 # overall progress in [0,1] if we want to track
         self._last_progress = 0.0
 
+        self._gauge = None # the gauge window
+
     # reset()
     def reset(self, *, seed=None, options=None):
         observation, info = self._env.reset(seed=seed, options=options)
@@ -131,9 +135,26 @@ class CarRacing(gym.Env):
     
     # render()
     def render(self):
-        return self._env.render()
-    
+        if self.render_mode == "rgb_array":
+            return self._env.render()
+        out = self._env.render()
+
+        # Update or create the separate gauge window
+        try:
+            self._ensure_gauge_window()
+            self._gauge.update(fuel=self._fuel, tire_health=1.0 - self._wear)
+        except Exception:
+            pass
+
+        return out
+
     def close(self):
+        try:
+            if self._gauge is not None:
+                self._gauge.close()
+                self._gauge = None
+        except Exception:
+            pass
         self._env.close()
 
     # Helper Functions
@@ -233,6 +254,94 @@ class CarRacing(gym.Env):
     def _get_velocity(self):
         v_t = self._env.unwrapped.car.hull.linearVelocity
         return np.linalg.norm(v_t)
+    
+    def _ensure_gauge_window(self):
+        if self._gauge is not None:
+            return
+        try:
+            self._gauge = _GaugeWindow(title="Fuel & Tire Gauges", width=280, height=110)
+        except Exception:
+            self._gauge = None
+
+class _GaugeWindow:
+    def __init__(self, title="Fuel & Tire Gauges", width=280, height=110):
+        self._pyglet = pyglet
+        self.window = pyglet.window.Window(width=width, height=height, caption=title, resizable=False, vsync=False)
+        self.batch = pyglet.graphics.Batch()
+        self.shapes = {}
+        self.labels = {}
+
+        # Layout
+        self.margin = 30
+        self.bar_w = width - self.margin*2
+        self.bar_h = 16
+        self.gap = 30
+
+        # Colors
+        self.col_bg   = (25, 25, 25)
+        self.col_ok   = (80, 200, 120)
+        self.col_warn = (240, 200, 80)
+        self.col_crit = (230, 80, 80)
+        self.col_text = (240, 240, 240, 255)
+
+        # Draws Fuel bar at the top and Tire Wear bar below
+        self._make_row("FUEL", y_top=height - self.margin)
+        self._make_row("TIRE WEAR", y_top=height - self.margin - (self.bar_h + self.gap))
+
+        # initial draw
+        self.update(1.0, 1.0)
+
+    def _make_row(self, name, y_top):
+        x0 = self.margin
+        self.shapes[(name, "bg")]   = shapes.Rectangle(x0, y_top - self.bar_h, self.bar_w, self.bar_h, color=self.col_bg, batch=self.batch)
+        self.shapes[(name, "fill")] = shapes.Rectangle(x0, y_top - self.bar_h, 1, self.bar_h, color=self.col_ok, batch=self.batch)
+        self.labels[(name, "left")] = self._pyglet.text.Label(
+            name, font_size=10, color=self.col_text, x=x0, y=y_top + 2,
+            anchor_x="left", anchor_y="baseline", batch=self.batch
+        )
+        self.labels[(name, "right")] = self._pyglet.text.Label(
+            "100%", font_size=10, color=self.col_text, x=x0 + self.bar_w, y=y_top - self.bar_h + 2,
+            anchor_x="right", anchor_y="baseline", batch=self.batch
+        )
+
+    def _colour_format(self, v):
+        if v > 0.5: return self.col_ok
+        if v > 0.2: return self.col_warn
+        return self.col_crit
+
+    def update(self, fuel, tire_health):
+        pyglet = self._pyglet
+
+        # Keep window responsive
+        pyglet.clock.tick()
+        self.window.switch_to()
+        self.window.dispatch_events()
+
+        fuel = float(np.clip(fuel, 0.0, 1.0))
+        tire = float(np.clip(tire_health, 0.0, 1.0))
+
+        # Update fills + labels
+        f_fill = self.shapes[("FUEL", "fill")]
+        f_fill.width = int(self.bar_w * fuel)
+        f_fill.color = self._colour_format(fuel)
+
+        t_fill = self.shapes[("TIRE WEAR", "fill")]
+        t_fill.width = int(self.bar_w * tire)
+        t_fill.color = self._colour_format(tire)
+
+        self.labels[("FUEL", "right")].text = f"{int(fuel*100)}%"
+        self.labels[("TIRE WEAR", "right")].text = f"{int(tire*100)}%"
+
+        # Draw this frame
+        self.window.clear()
+        self.batch.draw()
+        self.window.flip()
+
+    def close(self):
+        try:
+            self.window.close()
+        except Exception:
+            pass
     
     # TODO: Implement pitstop rendering
 
