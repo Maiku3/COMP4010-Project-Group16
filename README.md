@@ -5,8 +5,8 @@ Python 3.10
 
 **SETUP**
 1) Clone the repository and open it:
-git clone [<REPO_URL>.git](https://github.com/Maiku3/COMP4010-Project-Group16.git)
-cd <YOUR_REPO_FOLDER>
+`git clone [<REPO_URL>.git](https://github.com/Maiku3/COMP4010-Project-Group16.git)`
+`cd <YOUR_REPO_FOLDER>`
 
 2) Create a virtual environment:
     - If using Windows (PowerShell or CMD) run: `python -m venv .venv`
