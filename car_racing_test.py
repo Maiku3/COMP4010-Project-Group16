@@ -21,7 +21,8 @@ def main():
     while episode <= args.episodes:
         action = env.action_space.sample()
         observation, reward, terminated, truncated, info = env.step(action)
-        print(env._compute_offset())
+        env.render()
+        # print(env._compute_offset())
         episode_return += float(reward)
         episode_steps += 1
 

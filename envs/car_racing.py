@@ -3,6 +3,8 @@ import numpy as np
 from gymnasium import spaces
 from gymnasium.wrappers import TimeLimit
 import math
+import pyglet
+from pyglet import shapes
 
 class CarRacing(gym.Env):
 
@@ -20,7 +22,8 @@ class CarRacing(gym.Env):
     ):
         super(CarRacing, self).__init__()
         self._env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=continuous, lap_complete_percent=lap_complete_percent)
-        self._env = TimeLimit(self._env, max_episode_steps=max_episode_steps)
+        base_env = self._env.unwrapped
+        self._env = TimeLimit(base_env, max_episode_steps=max_episode_steps)
 
         self.render_mode = render_mode
         self.continuous = continuous
@@ -70,6 +73,27 @@ class CarRacing(gym.Env):
         self.progress = 0.0 # overall progress in [0,1] if we want to track
         self._last_progress = 0.0
 
+        self._gauge = None # the gauge window
+
+        # ==== Pitstop configuration ====
+        self._pit_center_test = False       # toggle to True to center pit stops and test
+        self._pit_speed_max = 5.0           # must be slow to service
+        self._pit_count = 25                # number of pit sectors per lap
+        self._pit_sector_width = 0.0075     # sector width in progress units
+
+        # Painted strip geometry (world-space)
+        self._pit_sign = 1.0
+        self._pit_inner_offset = 3.2        # start position relative to centerline
+        self._pit_width = 3.5               # thickness of the painted strip
+
+        # Detection must match the paint exactly:
+        self._pit_polys_count = 0
+        self._prev_pitroad     = False
+        self._pit_lock_sector  = None        # prevents spamming within the current sector
+
+        self._sync_pit_bounds()
+        # ===============================
+
     # reset()
     def reset(self, *, seed=None, options=None):
         observation, info = self._env.reset(seed=seed, options=options)
@@ -80,6 +104,15 @@ class CarRacing(gym.Env):
         self._wear = 0.0
         self._fuel = 1.0
 
+        self._prev_pitroad = False
+
+        # build static painted pit strips onto the track
+        try:
+            self._sync_pit_bounds() 
+            self._build_pit_polys()
+        except Exception:
+            pass
+
         return self._get_obs(observation), info
     
     # step()
@@ -89,6 +122,13 @@ class CarRacing(gym.Env):
         
         # Step in base environment
         observation, reward, terminated, truncated, info = self._env.step(base_action)
+
+        # If the car is off the track surface (and not in the pit),
+        # immediately terminate the episode.
+        if self._is_infield_from_offset() and not self._is_in_pit():
+            terminated = True
+            # Optional strong penalty to discourage leaving the track
+            reward -= 20.0
 
         # Get speed from box2d
         velocity = self._get_velocity()
@@ -114,26 +154,73 @@ class CarRacing(gym.Env):
         wear_rate_per_s *= speed_scale
         self._wear = min(1.0, self._wear + self._dt * wear_rate_per_s)
 
-        # Placeholder for infield and pitroad detection
-        infield = False
-        pitroad = False
+        # ==== PIT: detection + service (single service per sector) ====
+        ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
+        d_t = self._compute_offset()
 
-        # Pit Stop Logic
+        tile_idx = self._nearest_tile_index()   # tile index drives sector logic
+        in_sector, sector_idx = self._sector_state_by_index(tile_idx)
+        in_strip = (self._pit_d_min <= d_t <= self._pit_d_max)
+        pitroad = bool(in_sector and in_strip)
+
+        # edge logs
+        pit_enter = pitroad and not self._prev_pitroad
+        pit_exit  = (not pitroad) and self._prev_pitroad
+        self._prev_pitroad = pitroad
+
+        # clear lock when we're not in any sector (so next sector can service)
+        if not in_sector:
+            self._pit_lock_sector = None
+
         pit_executed = False
-        if pit_command and infield and pitroad and (velocity < 5.0):
-            self._fuel = 1.0
-            self._wear = 0.0
-            pit_executed = True
+        if pit_enter and (velocity < self._pit_speed_max):
+            # only service if we haven't serviced this sector yet
+            if self._pit_lock_sector is None or self._pit_lock_sector != sector_idx:
+                self._pit_lock_sector = sector_idx
+                self._fuel = 1.0
+                self._wear = 0.0
+                pit_executed = True
+                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
+
+        # logs to check edges
+        if pit_enter:
+            print(f"[PIT] ENTER sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
+        if pit_exit:
+            print(f"[PIT] EXIT  ell={ell_t:.3f} d_t={d_t:+.2f}")
+        # ==================================
+
+        info["pitroad"] = pitroad
+        info["pit_enter"] = pit_enter
+        info["pit_exit"] = pit_exit
         info["pit_executed"] = pit_executed
+        info["ell"] = float(ell_t)
+        info["d_t"] = float(d_t)
 
         # Update observation
         return self._get_obs(observation), reward, terminated, truncated, info
     
     # render()
     def render(self):
-        return self._env.render()
-    
+        if self.render_mode == "rgb_array":
+            return self._env.render()
+        out = self._env.render()
+
+        # Update or create the separate gauge window
+        try:
+            self._ensure_gauge_window()
+            self._gauge.update(fuel=self._fuel, tire_health=1.0 - self._wear)
+        except Exception:
+            pass
+
+        return out
+
     def close(self):
+        try:
+            if self._gauge is not None:
+                self._gauge.close()
+                self._gauge = None
+        except Exception:
+            pass
         self._env.close()
 
     # Helper Functions
@@ -224,15 +311,233 @@ class CarRacing(gym.Env):
 
     def _is_infield_from_offset(self):
         # Placeholder implementation
-        return False
+        # return False
+        # use lateral offset d_t from the track centerline. If |d_t| > 4.0 meters, treat as infield/off-track.
+        d_t = self._compute_offset()
+        return abs(d_t) > 4.0
+    
+    def _nearest_tile_index(self):
+        """
+        Index of the track tile whose center is closest 
+        to the car (aligns pit logic with painted tiles).
+        """
+        env = self._env.unwrapped
+        track = env.track
+        if not track:
+            return 0
+        car_x, car_y = float(env.car.hull.position[0]), float(env.car.hull.position[1])
+        best_i, best_d2 = 0, float("inf")
+        for i, (_, _, cx, cy) in enumerate(track):
+            dx, dy = car_x - cx, car_y - cy
+            d2 = dx*dx + dy*dy
+            if d2 < best_d2:
+                best_d2, best_i = d2, i
+        return best_i
+    
+    def _sector_state_by_index(self, tile_idx: int):
+        """
+        Given a tile index, return (in_sector, sector_idx) 
+        consistent with paint logic where prog = i / n.
+        """
+        env = self._env.unwrapped
+        n = max(1, len(env.track))
+        count = max(1, int(self._pit_count))
+        step = 1.0 / float(count)                 # sector length in progress units
+        width = float(self._pit_sector_width)     # painted width in progress units
 
-    def _is_in_pit(self):
-        # Placeholder implementation
-        return False
+        prog = tile_idx / float(n)
+        sector_idx = (tile_idx * count) // n
+        start = sector_idx * step
+
+        # tiny epsilon eliminates fencepost disagreement
+        eps = 1e-9
+        in_sector = (start - eps <= prog <= start + width + eps)
+        return in_sector, int(sector_idx)
+    
+    def _sync_pit_bounds(self):
+        """
+        Set lateral pit detection [d_min, d_max] to exactly 
+        match how the pit strip is drawn (centered or sided).
+        """
+        if self._pit_center_test:
+            half = float(abs(self._pit_width)) / 2.0
+            self._pit_d_min, self._pit_d_max = -half, +half
+        else:
+            inner = float(abs(self._pit_inner_offset))
+            width = float(abs(self._pit_width))
+            d_hi = self._pit_sign * inner
+            d_lo = self._pit_sign * (inner + width)
+            self._pit_d_min, self._pit_d_max = (min(d_lo, d_hi), max(d_lo, d_hi))
+
+    def _is_in_pit(self, d_t=None, ell_t=None):
+        """
+        Return True iff current lateral offset is within 
+        pit bounds and the current tile lies in a pit sector.
+        """
+        try:
+            if d_t is None:
+                d_t = self._compute_offset()
+            tile_idx = self._nearest_tile_index()
+            in_sector, _ = self._sector_state_by_index(tile_idx)
+            in_strip = (self._pit_d_min <= d_t <= self._pit_d_max)
+            return bool(in_sector and in_strip)
+        except Exception:
+            return False
 
     def _get_velocity(self):
         v_t = self._env.unwrapped.car.hull.linearVelocity
         return np.linalg.norm(v_t)
+    
+    def _ensure_gauge_window(self):
+        if self._gauge is not None:
+            return
+        try:
+            self._gauge = _GaugeWindow(title="Fuel & Tire Gauges", width=280, height=110)
+        except Exception:
+            self._gauge = None
+
+    def _build_pit_polys(self):
+        """
+        Build painted pit quads on the track.
+        """
+        env = self._env.unwrapped
+        track = getattr(env, "track", None)
+        if not track or len(track) < 2:
+            return
+
+        try:
+            if self._pit_polys_count > 0:
+                env.road_poly = env.road_poly[:-self._pit_polys_count]
+                self._pit_polys_count = 0
+        except Exception:
+            self._pit_polys_count = 0
+
+        n = len(track)
+        count = max(1, int(self._pit_count))
+        step = 1.0 / float(count)
+        width_prog = float(self._pit_sector_width)
+
+        PIT_COLOR = (255, 140, 0) # orange
+
+        def lateral_offset(cx, cy, beta, offset_m):
+            nx, ny = math.cos(beta), math.sin(beta)
+            return (cx + offset_m * nx, cy + offset_m * ny)
+
+        added = 0
+        for i in range(n - 1):
+            prog = i / float(n)
+            k = int((prog % 1.0) / step)
+            start = k * step
+            if not (start <= prog <= start + width_prog):
+                continue
+
+            _, beta_i, cx_i, cy_i = track[i]
+            _, beta_j, cx_j, cy_j = track[i + 1]
+
+            if self._pit_center_test:
+                half = float(abs(self._pit_width)) / 2.0
+                # left/right edges around the centerline
+                ix_i, iy_i = lateral_offset(cx_i, cy_i, beta_i, -half)
+                ox_i, oy_i = lateral_offset(cx_i, cy_i, beta_i, +half)
+                ix_j, iy_j = lateral_offset(cx_j, cy_j, beta_j, -half)
+                ox_j, oy_j = lateral_offset(cx_j, cy_j, beta_j, +half)
+            else:
+                inner = float(abs(self._pit_inner_offset))
+                strip_w = float(abs(self._pit_width))
+                # right side using sign
+                ix_i, iy_i = lateral_offset(cx_i, cy_i, beta_i, self._pit_sign * inner)
+                ox_i, oy_i = lateral_offset(cx_i, cy_i, beta_i, self._pit_sign * (inner + strip_w))
+                ix_j, iy_j = lateral_offset(cx_j, cy_j, beta_j, self._pit_sign * inner)
+                ox_j, oy_j = lateral_offset(cx_j, cy_j, beta_j, self._pit_sign * (inner + strip_w))
+
+            quad = [(ix_i, iy_i), (ox_i, oy_i), (ox_j, oy_j), (ix_j, iy_j)]
+            try:
+                env.road_poly.append((quad, PIT_COLOR))
+                added += 1
+            except Exception:
+                break
+
+        self._pit_polys_count = added
+
+class _GaugeWindow:
+    def __init__(self, title="Fuel & Tire Gauges", width=280, height=110):
+        self._pyglet = pyglet
+        self.window = pyglet.window.Window(width=width, height=height, caption=title, resizable=False, vsync=False)
+        self.batch = pyglet.graphics.Batch()
+        self.shapes = {}
+        self.labels = {}
+
+        # Layout
+        self.margin = 30
+        self.bar_w = width - self.margin*2
+        self.bar_h = 16
+        self.gap = 30
+
+        # Colors
+        self.col_bg   = (25, 25, 25)
+        self.col_ok   = (80, 200, 120)
+        self.col_warn = (240, 200, 80)
+        self.col_crit = (230, 80, 80)
+        self.col_text = (240, 240, 240, 255)
+
+        # Draws Fuel bar at the top and Tire Wear bar below
+        self._make_row("FUEL", y_top=height - self.margin)
+        self._make_row("TIRE WEAR", y_top=height - self.margin - (self.bar_h + self.gap))
+
+        # initial draw
+        self.update(1.0, 1.0)
+
+    def _make_row(self, name, y_top):
+        x0 = self.margin
+        self.shapes[(name, "bg")]   = shapes.Rectangle(x0, y_top - self.bar_h, self.bar_w, self.bar_h, color=self.col_bg, batch=self.batch)
+        self.shapes[(name, "fill")] = shapes.Rectangle(x0, y_top - self.bar_h, 1, self.bar_h, color=self.col_ok, batch=self.batch)
+        self.labels[(name, "left")] = self._pyglet.text.Label(
+            name, font_size=10, color=self.col_text, x=x0, y=y_top + 2,
+            anchor_x="left", anchor_y="baseline", batch=self.batch
+        )
+        self.labels[(name, "right")] = self._pyglet.text.Label(
+            "100%", font_size=10, color=self.col_text, x=x0 + self.bar_w, y=y_top - self.bar_h + 2,
+            anchor_x="right", anchor_y="baseline", batch=self.batch
+        )
+
+    def _colour_format(self, v):
+        if v > 0.5: return self.col_ok
+        if v > 0.2: return self.col_warn
+        return self.col_crit
+
+    def update(self, fuel, tire_health):
+        pyglet = self._pyglet
+
+        # Keep window responsive
+        pyglet.clock.tick()
+        self.window.switch_to()
+        self.window.dispatch_events()
+
+        fuel = float(np.clip(fuel, 0.0, 1.0))
+        tire = float(np.clip(tire_health, 0.0, 1.0))
+
+        # Update fills + labels
+        f_fill = self.shapes[("FUEL", "fill")]
+        f_fill.width = int(self.bar_w * fuel)
+        f_fill.color = self._colour_format(fuel)
+
+        t_fill = self.shapes[("TIRE WEAR", "fill")]
+        t_fill.width = int(self.bar_w * tire)
+        t_fill.color = self._colour_format(tire)
+
+        self.labels[("FUEL", "right")].text = f"{int(fuel*100)}%"
+        self.labels[("TIRE WEAR", "right")].text = f"{int(tire*100)}%"
+
+        # Draw this frame
+        self.window.clear()
+        self.batch.draw()
+        self.window.flip()
+
+    def close(self):
+        try:
+            self.window.close()
+        except Exception:
+            pass
     
     # TODO: Implement pitstop rendering
 
