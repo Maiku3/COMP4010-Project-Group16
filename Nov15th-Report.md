@@ -9,7 +9,7 @@
 
 * **Nicholas Nicolaev**: Implemented pit stop logic and added pit stop visual overlay on top of the base environment. See [Pull Request #9](https://github.com/Maiku3/COMP4010-Project-Group16/pull/9).
 
-* **Ziyang Ling**: Finalized the algorithms plan. Implemented DQN and PPO algorithms and train the agent.
+* **Ziyang Ling**: Finalized the algorithms plan. Implemented DQN and PPO algorithms and train the agent. [Pull Request #11](https://github.com/Maiku3/COMP4010-Project-Group16/pull/11)
 
 * **Mike Lin**: Made table to write and assign tasks so we can all be on the same page and meet project goals. Worked on environment.
 **PRs:**
