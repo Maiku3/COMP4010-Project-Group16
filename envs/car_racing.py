@@ -315,11 +315,6 @@ class CarRacing(gym.Env):
         # use lateral offset d_t from the track centerline. If |d_t| > 4.0 meters, treat as infield/off-track.
         d_t = self._compute_offset()
         return abs(d_t) > 4.0
-
-    def _is_in_pit(self):
-        # Placeholder implementation
-        # TODO: implement real pit-lane detection if needed.
-        return False
     
     def _nearest_tile_index(self):
         """
