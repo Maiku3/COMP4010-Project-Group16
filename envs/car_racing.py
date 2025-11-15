@@ -22,7 +22,8 @@ class CarRacing(gym.Env):
     ):
         super(CarRacing, self).__init__()
         self._env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=continuous, lap_complete_percent=lap_complete_percent)
-        self._env = TimeLimit(self._env, max_episode_steps=max_episode_steps)
+        base_env = self._env.unwrapped
+        self._env = TimeLimit(base_env, max_episode_steps=max_episode_steps)
 
         self.render_mode = render_mode
         self.continuous = continuous
@@ -121,6 +122,13 @@ class CarRacing(gym.Env):
         
         # Step in base environment
         observation, reward, terminated, truncated, info = self._env.step(base_action)
+
+        # If the car is off the track surface (and not in the pit),
+        # immediately terminate the episode.
+        if self._is_infield_from_offset() and not self._is_in_pit():
+            terminated = True
+            # Optional strong penalty to discourage leaving the track
+            reward -= 20.0
 
         # Get speed from box2d
         velocity = self._get_velocity()
@@ -303,6 +311,14 @@ class CarRacing(gym.Env):
 
     def _is_infield_from_offset(self):
         # Placeholder implementation
+        # return False
+        # use lateral offset d_t from the track centerline. If |d_t| > 4.0 meters, treat as infield/off-track.
+        d_t = self._compute_offset()
+        return abs(d_t) > 4.0
+
+    def _is_in_pit(self):
+        # Placeholder implementation
+        # TODO: implement real pit-lane detection if needed.
         return False
     
     def _nearest_tile_index(self):
