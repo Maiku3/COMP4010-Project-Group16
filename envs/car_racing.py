@@ -57,7 +57,7 @@ class CarRacing(gym.Env):
         self._fuel = 1.0   # 1=full, 0=empty
         self._dt = 1.0 / 50.0  # CarRacing runs at 50 frames per second
 
-        # Fuel (per second) 
+        # ===== Fuel (per second) ====== 
         # At idle: drains slowly, but at full gas: drains more (will need to adjust)
         self.fuel_base_per_s = 0.0015         # idle consumption
         self.fuel_full_per_s = 0.0110         # extra at gas=1 (so total ~0.0125/s at speed)
@@ -94,6 +94,10 @@ class CarRacing(gym.Env):
         self._sync_pit_bounds()
         # ===============================
 
+        # ==== How much wear impacts steering and gas ====
+        self.steering_grip_min = 0.3      # min grip at wear=1.0 (30% of steering)
+        self.steering_wear_strength = 0.0 # 1.0 = full effect, < 1.0 = weaker effect
+
     # reset()
     def reset(self, *, seed=None, options=None):
         observation, info = self._env.reset(seed=seed, options=options)
@@ -120,6 +124,9 @@ class CarRacing(gym.Env):
         # Map our action to base env (3 controls) + pit command
         base_action, pit_command = self._map_action(action)
         
+        # Get actions
+        steer, gas, brake = base_action[0], base_action[1], base_action[2]
+
         # Step in base environment
         observation, reward, terminated, truncated, info = self._env.step(base_action)
 
@@ -232,6 +239,16 @@ class CarRacing(gym.Env):
             gas   = float(np.clip(a[1],  0.0, 1.0))
             brake = float(np.clip(a[2],  0.0, 1.0))
             pit   = bool(a[3] >= 0.5)
+
+            # ==== wear-dependent steering and throttle ====
+            # g(wear) in [steering_grip_min, 1.0]
+            grip = 1.0 - self.steering_wear_strength * self._wear
+            grip = float(np.clip(grip, self.steering_grip_min, 1.0))
+            steer *= grip
+
+            # Throttle (acceleration) also affected by grip
+            gas *= grip
+
             return np.array([steer, gas, brake], dtype=np.float32), pit
         else:
             a = int(action)
@@ -243,6 +260,12 @@ class CarRacing(gym.Env):
             elif a == 4: base = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             elif a == 5: base = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             else: raise ValueError(f"Invalid discrete action {a}")
+
+            # Same grip logic for discrete mode
+            grip = 1.0 - self.steering_wear_strength * self._wear
+            grip = float(np.clip(grip, self.steering_grip_min, 1.0))
+            steer *= grip
+
             return base, pit
 
     def _get_obs(self, base_obs):
