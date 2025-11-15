@@ -316,8 +316,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    render_mode = "human" if args.render else None
-    # render_mode = "human"  # For testing purpose
+    # render_mode = "human" if args.render else None
+    render_mode = "human"  # For testing purpose
 
     env = make_env(
         render_mode=render_mode,
@@ -337,32 +337,32 @@ def main():
     episode_returns = agent.train()
     env.close()
 
-    # Plot for learning Output
-    if len(episode_returns) > 0:
-        plt.figure()
-        plt.plot(episode_returns, label="Episode return")
+    # # Plot for learning Output
+    # if len(episode_returns) > 0:
+    #     plt.figure()
+    #     plt.plot(episode_returns, label="Episode return")
 
-        # Optional moving average smoothing
-        window = max(1, len(episode_returns) // 20)
-        if window > 1:
-            cumsum = np.cumsum(np.insert(episode_returns, 0, 0))
-            smooth = (cumsum[window:] - cumsum[:-window]) / float(window)
-            plt.plot(
-                np.arange(window - 1, len(episode_returns)),
-                smooth,
-                label=f"Moving avg (window={window})",
-            )
+    #     # Optional moving average smoothing
+    #     window = max(1, len(episode_returns) // 20)
+    #     if window > 1:
+    #         cumsum = np.cumsum(np.insert(episode_returns, 0, 0))
+    #         smooth = (cumsum[window:] - cumsum[:-window]) / float(window)
+    #         plt.plot(
+    #             np.arange(window - 1, len(episode_returns)),
+    #             smooth,
+    #             label=f"Moving avg (window={window})",
+    #         )
 
-        plt.xlabel("Episode")
-        plt.ylabel("Return")
-        plt.title("PPO-Clip on Custom CarRacing")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("ppo_car_racing_returns.png", dpi=150)
-        plt.show()
-    else:
-        print("No completed episodes -> nothing to plot.")
+    #     plt.xlabel("Episode")
+    #     plt.ylabel("Return")
+    #     plt.title("PPO-Clip on Custom CarRacing")
+    #     plt.grid(True)
+    #     plt.legend()
+    #     plt.tight_layout()
+    #     plt.savefig("ppo_car_racing_returns.png", dpi=150)
+    #     plt.show()
+    # else:
+    #     print("No completed episodes -> nothing to plot.")
 
 
 if __name__ == "__main__":
