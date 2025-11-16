@@ -3,7 +3,7 @@
 
 ## What has been done during the past two weeks?
 
-* **Hanyoung Chung**: 
+* **Hanyoung Chung**: Added additional agent that uses the Soft Actor and Critic alogirithm [Pull Request *15](https://github.com/Maiku3/COMP4010-Project-Group16/pull/15).
 
 * **Jaden Chang**: 
 
