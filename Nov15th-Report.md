@@ -32,4 +32,4 @@ Changed state to have image and a vector, fuel and wear, and added helper functi
 
 * **Ziyang Ling**: Continue training the agent and modify the algorithms as needed. Prepare to get the result(plot with matplotlib etc.) for the algos.
 
-* **Mike Lin**: 
+* **Mike Lin**: Help with training and experimenting with algorithms and environment. Recording metrics and analyzing.
