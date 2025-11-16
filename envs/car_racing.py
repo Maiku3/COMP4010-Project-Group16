@@ -381,8 +381,51 @@ class CarRacing(gym.Env):
         return float(np.clip(signed_distance, -5.0, 5.0))
 
     def _compute_lookahead_curvature(self):
-        # Placeholder implementation
-        return 0.0 # kappa_t (curvature)
+        """
+        Estimate signed track curvature ahead of the car by looking at how the
+        road orientation (beta) changes over the next few tiles.
+
+        Positive kappa_t  -> turning one way
+        Negative kappa_t  -> turning the other way
+        """
+        env = self._env.unwrapped
+        track = getattr(env, "track", None)
+
+        # Need at least 2 tiles to define a turn
+        if not track or len(track) < 2:
+            return 0.0
+
+        n = len(track)
+        lookahead_tiles = 12 # how many segments ahead to average over
+
+        # Start from the tile closest to the car
+        idx = self._nearest_tile_index()
+
+        total_delta = 0.0
+        samples = 0
+
+        for k in range(lookahead_tiles):
+            i0 = (idx + k) % n
+            i1 = (idx + k + 1) % n
+
+            _, beta0, _, _ = track[i0]
+            _, beta1, _, _ = track[i1]
+
+            d_beta = self._angle_diff(beta1, beta0) # in [-pi, pi]
+            total_delta += d_beta
+            samples += 1
+
+        if samples == 0:
+            return 0.0
+
+        # Average turn per segment (radians)
+        avg_delta = total_delta / float(samples)
+
+        # Normalize to [-1, 1] by dividing by pi, then scale down to about [-0.05, 0.05]
+        kappa = (avg_delta / math.pi) * 0.05
+
+        return float(kappa)
+
 
     def _is_infield_from_offset(self):
         # Placeholder implementation
@@ -408,6 +451,16 @@ class CarRacing(gym.Env):
             if d2 < best_d2:
                 best_d2, best_i = d2, i
         return best_i
+    
+    @staticmethod
+    def _angle_diff(a: float, b: float) -> float:
+        """
+        Smallest signed difference between two angles a and b, in radians,
+        wrapped into [-pi, pi].
+        """
+        d = a - b
+        # Wrap using atan2(sin, cos) for numerical stability
+        return math.atan2(math.sin(d), math.cos(d))
     
     def _sector_state_by_index(self, tile_idx: int):
         """
