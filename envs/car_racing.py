@@ -19,6 +19,7 @@ class CarRacing(gym.Env):
         domain_randomize: bool = False,
         reward_shaping: bool = True,
         max_episode_steps: int = 3000,
+        max_laps: int = 1,
     ):
         super(CarRacing, self).__init__()
         self._env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=continuous, lap_complete_percent=lap_complete_percent)
@@ -98,6 +99,10 @@ class CarRacing(gym.Env):
         self.steering_grip_min = 0.3      # min grip at wear=1.0 (30% of steering)
         self.steering_wear_strength = 0.0 # 1.0 = full effect, < 1.0 = weaker effect
 
+        # Multi-lap state
+        self.max_laps = max(1, int(max_laps))
+        self._current_lap = 1
+
     # reset()
     def reset(self, *, seed=None, options=None):
         observation, info = self._env.reset(seed=seed, options=options)
@@ -109,6 +114,11 @@ class CarRacing(gym.Env):
         self._fuel = 1.0
 
         self._prev_pitroad = False
+
+        # reset lap counter
+        self._current_lap = 1
+        info["lap"] = self._current_lap
+        info["max_laps"] = self.max_laps
 
         # build static painted pit strips onto the track
         try:
@@ -161,8 +171,50 @@ class CarRacing(gym.Env):
         wear_rate_per_s *= speed_scale
         self._wear = min(1.0, self._wear + self._dt * wear_rate_per_s)
 
-        # ==== PIT: detection + service (single service per sector) ====
+        # per-lap progress on the current track
         ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
+
+        env_done = bool(terminated or truncated)
+        lap_finished = env_done and (ell_t >= self.lap_complete_percent - 1e-6)
+
+        info["lap"] = self._current_lap
+        info["max_laps"] = self.max_laps
+        info["lap_finished"] = False
+        info["reset_for_new_lap"] = False
+
+        if lap_finished and self._current_lap < self.max_laps:
+            # Finished a lap but not the whole race: start a new lap
+            finished_lap = self._current_lap
+            self._current_lap += 1
+            info["lap_finished"] = True
+            info["finished_lap"] = finished_lap
+
+            # Reset underlying env to start the next lap
+            observation, info_reset = self._env.reset()
+
+            # Keep fuel/wear across laps (endurance), but reset some internal race state
+            self.progress = 0.0
+            self._last_progress = 0.0
+            self._prev_pitroad = False
+            self._pit_lock_sector = None
+
+            try:
+                self._sync_pit_bounds()
+                self._build_pit_polys()
+            except Exception:
+                pass
+
+            # Don't end the episode from the agent's POV
+            terminated = False
+            truncated = False
+
+            # Recompute progress on the fresh lap
+            ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
+            info["reset_for_new_lap"] = True
+        else:
+            # Race progress across all laps [0,1]
+            if self.max_laps > 0:
+                self.progress = ((self._current_lap - 1) + ell_t) / float(self.max_laps)
         d_t = self._compute_offset()
 
         tile_idx = self._nearest_tile_index()   # tile index drives sector logic

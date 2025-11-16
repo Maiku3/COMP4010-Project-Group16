@@ -12,7 +12,8 @@ def main():
                     continuous=True, 
                     lap_complete_percent=0.95, 
                     reward_shaping=True, 
-                    max_episode_steps=3000)
+                    max_episode_steps=3000,
+                    max_laps=3)
 
     observation, info = env.reset(seed=args.seed)
     episode, episode_return, episode_steps = 1, 0.0, 0
@@ -25,6 +26,13 @@ def main():
         # print(env._compute_offset())
         episode_return += float(reward)
         episode_steps += 1
+
+        # log when a lap finishes
+        if info.get("lap_finished"):
+            print(
+                f"Finished lap {info.get('finished_lap')} "
+                f"-> starting lap {info.get('lap')} / {info.get('max_laps')}"
+            )
 
         # print telemetry
         if episode_steps % step_print_every == 0:
