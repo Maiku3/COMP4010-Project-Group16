@@ -6,6 +6,10 @@
 * **Hanyoung Chung**: Added additional agent that uses the Soft Actor and Critic alogirithm [Pull Request *15](https://github.com/Maiku3/COMP4010-Project-Group16/pull/15).
 
 * **Jaden Chang**: 
+Pull requests:
+- Added tire wear & fuel gauge bar rendering: [Pull Request #8](https://github.com/Maiku3/COMP4010-Project-Group16/pull/8)
+- Implemented more than one lap feature: [Pull Request #16](https://github.com/Maiku3/COMP4010-Project-Group16/pull/16)
+- Implement lookahead curvature: [Pull Request #17](https://github.com/Maiku3/COMP4010-Project-Group16/pull/17)
 
 * **Nicholas Nicolaev**: Implemented pit stop logic and added pit stop visual overlay on top of the base environment. See [Pull Request #9](https://github.com/Maiku3/COMP4010-Project-Group16/pull/9).
 
@@ -22,7 +26,7 @@ Changed state to have image and a vector, fuel and wear, and added helper functi
 
 * **Hanyoung Chung**: Research ways to simplify the problem as to reduce training tiue as much as possible. Also consider adding additional parameters that may help in faster training.
 
-* **Jaden Chang**: 
+* **Jaden Chang**: Help with further fine-tuning of the algorithms and prepare the agent training.
 
 * **Nicholas Nicolaev**: Help with algorithm development/plan and training.
 
