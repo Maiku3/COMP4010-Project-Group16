@@ -20,7 +20,7 @@ Changed state to have image and a vector, fuel and wear, and added helper functi
 
 ## What are you planning to do in the next two weeks?
 
-* **Hanyoung Chung**: 
+* **Hanyoung Chung**: Research ways to simplify the problem as to reduce training tiue as much as possible. Also consider adding additional parameters that may help in faster training.
 
 * **Jaden Chang**: 
 
