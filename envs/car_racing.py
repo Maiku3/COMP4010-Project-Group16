@@ -19,6 +19,7 @@ class CarRacing(gym.Env):
         domain_randomize: bool = False,
         reward_shaping: bool = True,
         max_episode_steps: int = 3000,
+        max_laps: int = 1,
     ):
         super(CarRacing, self).__init__()
         self._env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=continuous, lap_complete_percent=lap_complete_percent)
@@ -28,6 +29,9 @@ class CarRacing(gym.Env):
         self.continuous = continuous
         self.lap_complete_percent = lap_complete_percent
         self._reward_shaping = reward_shaping
+
+        self.max_laps = max(1, int(max_laps))
+        self._current_lap = 1
 
         # State S_t
         image_space = spaces.Box(0, 255, shape=(96, 96, 3), dtype=np.uint8)
@@ -84,6 +88,11 @@ class CarRacing(gym.Env):
         self._wear = 0.0
         self._fuel = 1.0
 
+        self._current_lap = 1
+
+        info["lap"] = self._current_lap
+        info["max_laps"] = self.max_laps
+
         return self._get_obs(observation), info
     
     # step()
@@ -118,6 +127,16 @@ class CarRacing(gym.Env):
         wear_rate_per_s *= speed_scale
         self._wear = min(1.0, self._wear + self._dt * wear_rate_per_s)
 
+        # per-lap progress + overall progress
+        base_env = self._env.unwrapped
+        if getattr(base_env, "track", None):
+            ell_t = base_env.tile_visited_count / len(base_env.track)
+        else:
+            ell_t = 0.0
+
+        # overall race progress in [0,1]
+        self.progress = ((self._current_lap - 1) + ell_t) / float(self.max_laps)
+
         # Placeholder for infield and pitroad detection
         infield = False
         pitroad = False
@@ -129,6 +148,32 @@ class CarRacing(gym.Env):
             self._wear = 0.0
             pit_executed = True
         info["pit_executed"] = pit_executed
+
+        env_done = bool(terminated or truncated)
+        lap_finished = env_done and (ell_t >= self.lap_complete_percent - 1e-6)
+
+        info["lap"] = self._current_lap
+        info["max_laps"] = self.max_laps
+        info["lap_finished"] = False
+
+        if lap_finished and self._current_lap < self.max_laps:
+            # Completed a lap, but not the whole race: start a new lap.
+            info["lap_finished"] = True
+            finished_lap = self._current_lap
+            self._current_lap += 1
+
+            # Reset underlying env to start next lap (same map)
+            observation, info_reset = self._env.reset()
+
+            # Do not end the episode 
+            terminated = False
+            truncated = False
+
+            info["finished_lap"] = finished_lap
+            info["lap"] = self._current_lap
+            info["reset_for_new_lap"] = True
+        else:
+            info["reset_for_new_lap"] = False
 
         # Update observation
         return self._get_obs(observation), reward, terminated, truncated, info
