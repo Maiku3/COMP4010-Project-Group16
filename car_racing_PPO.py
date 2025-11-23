@@ -87,10 +87,11 @@ class PPOBuffer:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_low, action_high, log_std_init: float = -0.5):
         super().__init__()
 
         hidden = 128
+        action_dim = len(action_low)
 
         # mean of Gaussian
         self.pi_net = nn.Sequential(
@@ -101,7 +102,7 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden, action_dim),
         )
         # State-independent log_std
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.ones(action_dim) * log_std_init)
 
         self.v_net = nn.Sequential(
             nn.Linear(state_dim, hidden),
@@ -111,6 +112,13 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden, 1),
         )
 
+        low_t = torch.as_tensor(action_low, dtype=torch.float32)
+        high_t = torch.as_tensor(action_high, dtype=torch.float32)
+        self.register_buffer("action_low", low_t)
+        self.register_buffer("action_high", high_t)
+        self.register_buffer("action_scale", (high_t - low_t) / 2.0)
+        self.register_buffer("action_bias", (high_t + low_t) / 2.0)
+
     def _distribution(self, obs):
         mu = self.pi_net(obs)
         std = torch.exp(self.log_std)
@@ -119,14 +127,29 @@ class ActorCritic(nn.Module):
     def _value(self, obs):
         return self.v_net(obs).squeeze(-1)
 
-    def step(self, obs, action_low, action_high):
+    def _squash_action(self, raw_action, dist: Normal):
+        squashed = torch.tanh(raw_action)
+        action = squashed * self.action_scale + self.action_bias
+
+        # log prob with tanh change-of-variables
+        logp = dist.log_prob(raw_action) - torch.log(
+            torch.clamp(1 - squashed.pow(2), min=1e-6)
+        )
+        logp = logp.sum(-1)
+        return action, logp
+
+    def _unsquash_action(self, action):
+        normed = (action - self.action_bias) / torch.clamp(self.action_scale, min=1e-6)
+        normed = torch.clamp(normed, -0.999, 0.999)
+        raw_action = torch.atanh(normed)
+        return raw_action, normed
+
+    def step(self, obs):
         with torch.no_grad():
             dist = self._distribution(obs.unsqueeze(0))
             raw_action = dist.rsample()
 
-            action = torch.max(torch.min(raw_action, action_high), action_low)
-
-            logp = dist.log_prob(action).sum(-1)
+            action, logp = self._squash_action(raw_action, dist)
             value = self._value(obs.unsqueeze(0))
 
         return (
@@ -136,8 +159,12 @@ class ActorCritic(nn.Module):
         )
 
     def evaluate(self, obs, act):
+        raw_action, squashed = self._unsquash_action(act)
         dist = self._distribution(obs)
-        logp = dist.log_prob(act).sum(-1)
+        logp = dist.log_prob(raw_action) - torch.log(
+            torch.clamp(1 - squashed.pow(2), min=1e-6)
+        )
+        logp = logp.sum(-1)
         entropy = dist.entropy().sum(-1)
         value = self._value(obs)
         return logp, entropy, value
@@ -155,6 +182,7 @@ class PPOConfig:
     train_v_iters: int = 80
     target_kl: float = 0.01
     max_ep_len: int = 100000
+    entropy_coef: float = 0.01
 
 
 class PPOCarRacingAgent:
@@ -169,18 +197,13 @@ class PPOCarRacingAgent:
 
         state_dim = env.observation_space["state"].shape[0]
         action_dim = env.action_space.shape[0]
+        action_low = env.action_space.low
+        action_high = env.action_space.high
 
-        self.ac = ActorCritic(state_dim, action_dim).to(self.device)
+        self.ac = ActorCritic(state_dim, action_low, action_high).to(self.device)
 
         self.pi_optimizer = optim.Adam(self.ac.parameters(), lr=self.cfg.pi_lr)
         self.vf_optimizer = optim.Adam(self.ac.parameters(), lr=self.cfg.vf_lr)
-
-        self.action_low = torch.tensor(
-            env.action_space.low, dtype=torch.float32, device=self.device
-        )
-        self.action_high = torch.tensor(
-            env.action_space.high, dtype=torch.float32, device=self.device
-        )
 
         self.buf = PPOBuffer(
             obs_dim=state_dim,
@@ -190,9 +213,38 @@ class PPOCarRacingAgent:
             lam=self.cfg.lam,
         )
 
+        # Reward shaping knobs
+        self.progress_coef = 60.0
+        self.center_penalty = 0.5
+        self.offtrack_penalty = 20.0
+        self.pit_bonus = 25.0
+        self.speed_target = 35.0
+        self.speed_coef = 0.05
+        self.prev_ell = 0.0
+
     @staticmethod
     def _obs_to_state(obs):
         return np.asarray(obs["state"], dtype=np.float32)
+
+    def _shape_reward(self, obs, next_obs, env_reward: float, info: dict | None):
+        if info is None:
+            info = {}
+
+        d_t = float(next_obs["state"][0])
+        v_t = float(next_obs["state"][1])
+        off_track = bool(next_obs["state"][2] > 0.5)
+        ell = float(next_obs["state"][4])
+
+        delta_ell = max(0.0, ell - self.prev_ell)
+        progress_r = self.progress_coef * delta_ell
+        center_r = -self.center_penalty * abs(d_t)
+        speed_r = self.speed_coef * min(1.0, v_t / self.speed_target)
+        offtrack_r = -self.offtrack_penalty if off_track else 0.0
+        pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
+
+        shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r
+        self.prev_ell = ell
+        return float(shaped)
 
     def update(self):
         data = self.buf.get()
@@ -211,7 +263,8 @@ class PPOCarRacingAgent:
             obj2 = torch.clamp(
                 ratio, 1.0 - self.cfg.clip_ratio, 1.0 + self.cfg.clip_ratio
             ) * adv
-            pi_loss = -torch.min(obj1, obj2).mean()
+            entropy_bonus = self.cfg.entropy_coef * entropy.mean()
+            pi_loss = -(torch.min(obj1, obj2).mean() + entropy_bonus)
 
             approx_kl = (logp_old - logp).mean().item()
             if approx_kl > 1.5 * self.cfg.target_kl:
@@ -236,11 +289,14 @@ class PPOCarRacingAgent:
         env = self.env
 
         episode_returns = []
+        episode_env_returns = []
 
         # Initial reset
         full_obs, _ = env.reset()
         obs = self._obs_to_state(full_obs)
+        self.prev_ell = float(full_obs["state"][4])
         ep_ret = 0.0
+        ep_env_ret = 0.0
         ep_len = 0
 
         total_steps = cfg.steps_per_epoch * cfg.epochs
@@ -248,17 +304,20 @@ class PPOCarRacingAgent:
         for epoch in range(cfg.epochs):
             for t in range(cfg.steps_per_epoch):
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                act, val, logp = self.ac.step(obs_t, self.action_low, self.action_high)
+                act, val, logp = self.ac.step(obs_t)
 
-                next_full_obs, reward, terminated, truncated, _ = env.step(act)
+                next_full_obs, reward, terminated, truncated, info = env.step(act)
                 next_obs = self._obs_to_state(next_full_obs)
 
-                ep_ret += float(reward)
+                shaped_reward = self._shape_reward(full_obs, next_full_obs, float(reward), info)
+                ep_ret += shaped_reward
+                ep_env_ret += float(reward)
                 ep_len += 1
 
-                self.buf.store(obs, act, reward, val, logp)
+                self.buf.store(obs, act, shaped_reward, val, logp)
 
                 obs = next_obs
+                full_obs = next_full_obs
 
                 timeout = ep_len >= cfg.max_ep_len
                 terminal = bool(terminated)
@@ -279,10 +338,13 @@ class PPOCarRacingAgent:
 
                     if terminal or timeout or bool(truncated):
                         episode_returns.append(ep_ret)
-                        print(f"[PPO] Ep {len(episode_returns)} | Ep len={ep_len} | return={ep_ret:.2f} | terminated={terminated} truncated={truncated}")
+                        episode_env_returns.append(ep_env_ret)
+                        print(f"[PPO] Ep {len(episode_returns)} | Ep len={ep_len} | shaped_return={ep_ret:.2f} | env_return={ep_env_ret:.2f} | terminated={terminated} truncated={truncated}")
                         full_obs, _ = env.reset()
                         obs = self._obs_to_state(full_obs)
+                        self.prev_ell = float(full_obs["state"][4])
                         ep_ret = 0.0
+                        ep_env_ret = 0.0
                         ep_len = 0
 
                     if epoch_ended:
@@ -316,8 +378,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # render_mode = "human" if args.render else None
-    render_mode = "human"  # For testing purpose
+    render_mode = "human" if args.render else None
+    # render_mode = "human" # For testing purpose
 
     env = make_env(
         render_mode=render_mode,
@@ -337,34 +399,34 @@ def main():
     episode_returns = agent.train()
     env.close()
 
-    # # Plot for learning Output
-    # if len(episode_returns) > 0:
-    #     plt.figure()
-    #     plt.plot(episode_returns, label="Episode return")
+    # Plot and persist learning output for later comparison
+    if len(episode_returns) > 0:
+        returns_arr = np.asarray(episode_returns, dtype=np.float32)
 
-    #     # Optional moving average smoothing
-    #     window = max(1, len(episode_returns) // 20)
-    #     if window > 1:
-    #         cumsum = np.cumsum(np.insert(episode_returns, 0, 0))
-    #         smooth = (cumsum[window:] - cumsum[:-window]) / float(window)
-    #         plt.plot(
-    #             np.arange(window - 1, len(episode_returns)),
-    #             smooth,
-    #             label=f"Moving avg (window={window})",
-    #         )
+        plt.figure()
+        plt.plot(returns_arr, label="Episode return")
 
-    #     plt.xlabel("Episode")
-    #     plt.ylabel("Return")
-    #     plt.title("PPO-Clip on Custom CarRacing")
-    #     plt.grid(True)
-    #     plt.legend()
-    #     plt.tight_layout()
-    #     plt.savefig("ppo_car_racing_returns.png", dpi=150)
-    #     plt.show()
-    # else:
-    #     print("No completed episodes -> nothing to plot.")
+        window = max(1, len(returns_arr) // 20)
+        if window > 1:
+            kernel = np.ones(window) / float(window)
+            smooth = np.convolve(returns_arr, kernel, mode="valid")
+            plt.plot(
+                np.arange(window - 1, len(returns_arr)),
+                smooth,
+                label=f"Moving avg (window={window})",
+            )
+
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.title("PPO-Clip on Custom CarRacing")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("ppo_car_racing_returns.png", dpi=150)
+        plt.close()
+    else:
+        print("No completed episodes -> nothing to plot.")
 
 
 if __name__ == "__main__":
     main()
-
