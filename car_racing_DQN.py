@@ -121,6 +121,15 @@ class DQNCarRacingAgent:
         self.epsilon_decay_steps = epsilon_decay_steps
         self.global_step = 0
 
+        # Reward shaping knobs
+        self.progress_coef = 60.0
+        self.center_penalty = 0.5
+        self.offtrack_penalty = 20.0
+        self.pit_bonus = 25.0
+        self.speed_target = 35.0
+        self.speed_coef = 0.05
+        self.prev_ell = 0.0
+
     @staticmethod
     def _obs_to_state(obs) -> np.ndarray:
         return np.asarray(obs["state"], dtype=np.float32)
@@ -140,6 +149,28 @@ class DQNCarRacingAgent:
             action_idx = int(torch.argmax(q_values, dim=1).item())
 
         return action_idx, self.actions_table[action_idx]
+
+    def _shape_reward(self, obs, next_obs, env_reward: float, info: dict | None):
+        if info is None:
+            info = {}
+
+        # Base signals from state vector
+        d_t = float(next_obs["state"][0])
+        v_t = float(next_obs["state"][1])
+        off_track = bool(next_obs["state"][2] > 0.5)
+        ell = float(next_obs["state"][4])
+
+        delta_ell = max(0.0, ell - self.prev_ell)
+        progress_r = self.progress_coef * delta_ell
+
+        center_r = -self.center_penalty * abs(d_t)
+        speed_r = self.speed_coef * min(1.0, v_t / self.speed_target)
+        offtrack_r = -self.offtrack_penalty if off_track else 0.0
+        pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
+
+        shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r
+        self.prev_ell = ell
+        return float(shaped)
 
     def train_step(self):
         if len(self.replay) < self.min_replay_size:
@@ -178,8 +209,10 @@ class DQNCarRacingAgent:
     def train(self, total_timesteps: int):
         obs, _ = self.env.reset()
         state = self._obs_to_state(obs)
+        self.prev_ell = float(obs["state"][4])
 
-        episode_reward = 0.0
+        episode_reward = 0.0  # shaped return
+        episode_env_reward = 0.0
         episode = 0
         episode_returns = []
 
@@ -187,24 +220,29 @@ class DQNCarRacingAgent:
             self._update_epsilon()
 
             action_idx, action = self.select_action(state)
-            next_obs, reward, terminated, truncated, _ = self.env.step(action)
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
             next_state = self._obs_to_state(next_obs)
             done = bool(terminated or truncated)
 
-            self.replay.push(state, action_idx, float(reward), next_state, float(terminated), float(truncated))
+            shaped_reward = self._shape_reward(obs, next_obs, float(reward), info)
+            self.replay.push(state, action_idx, shaped_reward, next_state, float(terminated), float(truncated))
             self.train_step()
 
             state = next_state
-            episode_reward += float(reward)
+            obs = next_obs
+            episode_reward += shaped_reward
+            episode_env_reward += float(reward)
 
             episode_done = bool(terminated or truncated)
             if episode_done:
                 episode += 1
                 episode_returns.append(episode_reward)
-                print(f"[DQN] Ep {episode} | step={t+1} | return={episode_reward:.2f} | eps={self.epsilon:.3f} | terminated={terminated} truncated={truncated}")
+                print(f"[DQN] Ep {episode} | step={t+1} | shaped_return={episode_reward:.2f} | env_return={episode_env_reward:.2f} | eps={self.epsilon:.3f} | terminated={terminated} truncated={truncated}")
                 obs, _ = self.env.reset()
                 state = self._obs_to_state(obs)
+                self.prev_ell = float(obs["state"][4])
                 episode_reward = 0.0
+                episode_env_reward = 0.0
 
         return episode_returns
 
@@ -223,7 +261,7 @@ def make_env(render_mode=None, seed: int = 0, max_episode_steps: int = 100000) -
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total-timesteps", type=int, default=20000)
+    parser.add_argument("--total-timesteps", type=int, default=100000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--bins",
@@ -241,8 +279,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # render_mode = "human" if args.render else None
-    render_mode = "human"  # For testing purpose
+    render_mode = "human" if args.render else None
+    # render_mode = "human" # For testing purpose
 
     env = make_env(
         render_mode=render_mode,
@@ -258,31 +296,33 @@ def main():
     episode_returns = agent.train(total_timesteps=args.total_timesteps)
     env.close()
 
-    # # Plot for learning Output 
-    # if len(episode_returns) > 0:
-    #     plt.figure()
-    #     plt.plot(episode_returns, label="Episode return")
+    # Plot and persist learning output for later comparison
+    if len(episode_returns) > 0:
+        returns_arr = np.asarray(episode_returns, dtype=np.float32)
 
-    #     window = max(1, len(episode_returns) // 20)
-    #     if window > 1:
-    #         cumsum = np.cumsum(np.insert(episode_returns, 0, 0))
-    #         smooth = (cumsum[window:] - cumsum[:-window]) / float(window)
-    #         plt.plot(
-    #             np.arange(window - 1, len(episode_returns)),
-    #             smooth,
-    #             label=f"Moving avg (window={window})",
-    #         )
+        plt.figure()
+        plt.plot(returns_arr, label="Episode return")
 
-    #     plt.xlabel("Episode")
-    #     plt.ylabel("Return")
-    #     plt.title("DQN (discretized actions) on Custom CarRacing")
-    #     plt.grid(True)
-    #     plt.legend()
-    #     plt.tight_layout()
-    #     plt.savefig("dqn_car_racing_returns.png", dpi=150)
-    #     plt.show()
-    # else:
-    #     print("No completed episodes -> nothing to plot.")
+        window = max(1, len(returns_arr) // 20)
+        if window > 1:
+            kernel = np.ones(window) / float(window)
+            smooth = np.convolve(returns_arr, kernel, mode="valid")
+            plt.plot(
+                np.arange(window - 1, len(returns_arr)),
+                smooth,
+                label=f"Moving avg (window={window})",
+            )
+
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.title("DQN on Custom CarRacing")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("dqn_car_racing_returns.png", dpi=150)
+        plt.close()
+    else:
+        print("No completed episodes -> nothing to plot.")
 
 
 if __name__ == "__main__":
