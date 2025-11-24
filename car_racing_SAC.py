@@ -1,4 +1,8 @@
+import argparse
 import random
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,9 +10,38 @@ import torch.optim as optim
 
 from envs.car_racing import CarRacing
 
-# Replay Buffer
+class RunningNorm:
+
+    def __init__(self, shape, eps=1e-4):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps
+
+    def update(self, x: np.ndarray):
+        x = np.asarray(x, dtype=np.float64)
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x: np.ndarray):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
 class ReplayBuffer:
-    def __init__(self, capacity, state_dim, action_dim):
+    def __init__(self, capacity: int, state_dim: int, action_dim: int):
         self.capacity = capacity
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -21,7 +54,7 @@ class ReplayBuffer:
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros((capacity,), dtype=np.float32)
 
-    def push(self, state, action, reward, next_state, done):
+    def store(self, state, action, reward, next_state, done):
         idx = self.pos
         self.states[idx] = state
         self.actions[idx] = action
@@ -40,275 +73,368 @@ class ReplayBuffer:
         max_index = self.capacity if self.full else self.pos
         idxs = np.random.randint(0, max_index, size=batch_size)
 
-        states = torch.from_numpy(self.states[idxs]).to(device)
-        actions = torch.from_numpy(self.actions[idxs]).to(device)
-        rewards = torch.from_numpy(self.rewards[idxs]).to(device)
-        next_states = torch.from_numpy(self.next_states[idxs]).to(device)
-        dones = torch.from_numpy(self.dones[idxs]).to(device)
-
+        # Explicit dtype keeps NumPy 1.x/2.x builds from tripping torch inference.
+        states = torch.as_tensor(self.states[idxs], dtype=torch.float32, device=device)
+        actions = torch.as_tensor(self.actions[idxs], dtype=torch.float32, device=device)
+        rewards = (
+            torch.as_tensor(self.rewards[idxs], dtype=torch.float32, device=device)
+            .unsqueeze(1)
+        )
+        next_states = torch.as_tensor(
+            self.next_states[idxs], dtype=torch.float32, device=device
+        )
+        dones = (
+            torch.as_tensor(self.dones[idxs], dtype=torch.float32, device=device)
+            .unsqueeze(1)
+        )
         return states, actions, rewards, next_states, dones
 
-# Networks
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.Linear(state_dim + action_dim, hidden),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden, 1),
         )
 
     def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        return self.net(x)
+        return self.net(torch.cat([state, action], dim=-1))
 
 
 class GaussianPolicy(nn.Module):
-    """
-    Stochastic policy: outputs mean + log_std of a Gaussian,
-    then uses tanh-squashing to keep actions in [-1, 1],
-    and we rescale to env.action_space bounds outside.
-    """
-    def __init__(self, state_dim, action_dim, hidden_dim=256, log_std_min=-20, log_std_max=2):
+    def __init__(self, state_dim, action_dim, hidden=256, log_std_bounds=(-5.0, 1.0)):
         super().__init__()
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-
+        self.log_std_min, self.log_std_max = log_std_bounds
         self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+            nn.Linear(state_dim, hidden),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
         )
-        self.mean_linear = nn.Linear(hidden_dim, action_dim)
-        self.log_std_linear = nn.Linear(hidden_dim, action_dim)
+        self.mu = nn.Linear(hidden, action_dim)
+        self.log_std = nn.Linear(hidden, action_dim)
 
-    def forward(self, state):
-        x = self.net(state)
-        mean = self.mean_linear(x)
-        log_std = self.log_std_linear(x)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        return mean, log_std
+    def _distribution(self, state):
+        h = self.net(state)
+        mu = self.mu(h)
+        log_std = torch.clamp(self.log_std(h), self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std)
+        return torch.distributions.Normal(mu, std)
 
     def sample(self, state):
-        """
-        Returns:
-          action: squashed + rescaled action in [-1, 1] (before env rescale)
-          log_prob: log π(a|s)
-          pre_tanh: the unsquashed Gaussian sample
-        """
-        mean, log_std = self.forward(state)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        z = normal.rsample()               # reparameterization trick
+        dist = self._distribution(state)
+        z = dist.rsample()  # reparameterization
         action = torch.tanh(z)
-        # log π(a|s) with tanh correction
-        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        # tanh correction for log_prob
+        log_prob = dist.log_prob(z) - torch.log(torch.clamp(1 - action.pow(2), min=1e-6))
         log_prob = log_prob.sum(dim=-1, keepdim=True)
-        return action, log_prob, z
+        return action, log_prob
 
-    def sample_deterministic(self, state):
-        mean, _ = self.forward(state)
-        action = torch.tanh(mean)
+    def deterministic(self, state):
+        dist = self._distribution(state)
+        action = torch.tanh(dist.mean)
         return action
 
-# Soft update
-def soft_update(target, source, tau):
+
+def soft_update(target: nn.Module, source: nn.Module, tau: float):
     for t_param, s_param in zip(target.parameters(), source.parameters()):
         t_param.data.copy_(t_param.data * (1.0 - tau) + s_param.data * tau)
 
+@dataclass
+class SACConfig:
+    total_steps: int = 300_000
+    max_ep_len: int = 3000
+    gamma: float = 0.99
+    tau: float = 0.005
+    lr: float = 3e-4
+    alpha_lr: float = 3e-4
+    batch_size: int = 256
+    replay_size: int = 400_000
+    start_steps: int = 10_000
+    update_after: int = 5_000
+    update_every: int = 1
+    updates_per_step: int = 1
+    target_entropy_scale: float = 1.0  # multiplied by -action_dim
+    reward_clip: float = 50.0
+    seed: int = 0
+    render: bool = False
 
-# SAC Training Loop
-def train_sac(
-    num_episodes=500,
-    max_steps=3000,
-    gamma=0.99,
-    batch_size=128,
-    lr=3e-4,
-    replay_size=200_000,
-    start_steps=10_000,        # collect this many random steps before using policy
-    updates_per_step=1,
-    tau=0.005,                 # target smoothing coefficient
-    alpha=0.2,                 # initial entropy temperature (if auto_alpha=False, this stays fixed)
-    auto_alpha=True,
-    seed=0,
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
 
-    # --- Environment: continuous=True for SAC ---
+class SACCarRacingAgent:
+    def __init__(self, env: CarRacing, cfg: SACConfig, device=None):
+        self.env = env
+        self.cfg = cfg
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.state_low = np.asarray(env.observation_space["state"].low, dtype=np.float32)
+        self.state_high = np.asarray(env.observation_space["state"].high, dtype=np.float32)
+        self.state_scale = np.maximum(self.state_high - self.state_low, 1e-3)
+        self.state_rms = RunningNorm(self.state_low.shape)
+
+        # Explicit dtype to avoid inference issues with newer NumPy builds.
+        self.action_low = torch.as_tensor(
+            env.action_space.low, dtype=torch.float32, device=self.device
+        )
+        self.action_high = torch.as_tensor(
+            env.action_space.high, dtype=torch.float32, device=self.device
+        )
+
+        state_dim = env.observation_space["state"].shape[0]
+        action_dim = env.action_space.shape[0]
+
+        self.policy = GaussianPolicy(state_dim, action_dim).to(self.device)
+        self.q1 = QNetwork(state_dim, action_dim).to(self.device)
+        self.q2 = QNetwork(state_dim, action_dim).to(self.device)
+        self.q1_target = QNetwork(state_dim, action_dim).to(self.device)
+        self.q2_target = QNetwork(state_dim, action_dim).to(self.device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.policy_opt = optim.Adam(self.policy.parameters(), lr=self.cfg.lr)
+        self.q1_opt = optim.Adam(self.q1.parameters(), lr=self.cfg.lr)
+        self.q2_opt = optim.Adam(self.q2.parameters(), lr=self.cfg.lr)
+
+        # Automatic entropy tuning
+        self.target_entropy = -self.cfg.target_entropy_scale * float(action_dim)
+        self.log_alpha = torch.tensor(np.log(0.2), device=self.device, requires_grad=True)
+        self.alpha_opt = optim.Adam([self.log_alpha], lr=self.cfg.alpha_lr)
+
+        self.alpha = float(self.log_alpha.exp().item())
+
+        self.replay = ReplayBuffer(self.cfg.replay_size, state_dim, action_dim)
+
+        # Reward shaping knobs (matches PPO/DQN for comparability)
+        self.progress_coef = 60.0
+        self.center_penalty = 0.5
+        self.offtrack_penalty = 20.0
+        self.pit_bonus = 25.0
+        self.speed_target = 35.0
+        self.speed_coef = 0.05
+        self.prev_ell = 0.0
+
+    def _obs_to_state(self, obs):
+        state = np.asarray(obs["state"], dtype=np.float32)
+        state = np.clip(state, self.state_low, self.state_high)
+        self.state_rms.update(state)
+        normed = self.state_rms.normalize(state)
+        return np.clip(normed, -5.0, 5.0)
+
+    def _shape_reward(self, obs, next_obs, env_reward: float, info: dict | None):
+        if info is None:
+            info = {}
+        d_t = float(next_obs["state"][0])
+        v_t = float(next_obs["state"][1])
+        off_track = bool(next_obs["state"][2] > 0.5)
+        ell = float(next_obs["state"][4])
+
+        delta_ell = max(0.0, ell - self.prev_ell)
+        progress_r = self.progress_coef * delta_ell
+        center_r = -self.center_penalty * abs(d_t)
+        speed_r = self.speed_coef * min(1.0, v_t / self.speed_target)
+        offtrack_r = -self.offtrack_penalty if off_track else 0.0
+        pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
+
+        shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r
+        shaped = np.clip(shaped, -self.cfg.reward_clip, self.cfg.reward_clip)
+        self.prev_ell = ell
+        return float(shaped)
+
+    def _rescale_action(self, squashed_action: torch.Tensor):
+        return self.action_low + (squashed_action + 1.0) * 0.5 * (self.action_high - self.action_low)
+
+    def select_action(self, state: np.ndarray, deterministic: bool = False):
+        s_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            if deterministic:
+                a = self.policy.deterministic(s_t)
+            else:
+                a, _ = self.policy.sample(s_t)
+        a = self._rescale_action(a.squeeze(0))
+        # Avoid torch -> numpy bridge (fails if torch was built against NumPy 1.x and NumPy 2.x is installed).
+        a_list = a.detach().cpu().view(-1).tolist()
+        return np.asarray(a_list, dtype=np.float32)
+
+    def update(self):
+        if len(self.replay) < self.cfg.batch_size:
+            return
+
+        states, actions, rewards, next_states, dones = self.replay.sample(
+            self.cfg.batch_size, self.device
+        )
+
+        # Critic targets
+        with torch.no_grad():
+            next_actions, next_logp = self.policy.sample(next_states)
+            next_actions_env = self._rescale_action(next_actions)
+            q1_next = self.q1_target(next_states, next_actions_env)
+            q2_next = self.q2_target(next_states, next_actions_env)
+            q_next_min = torch.min(q1_next, q2_next)
+            alpha_val = self.log_alpha.exp()
+            target_q = rewards + self.cfg.gamma * (1.0 - dones) * (q_next_min - alpha_val * next_logp)
+
+        # Q1, Q2 losses
+        q1_pred = self.q1(states, actions)
+        q2_pred = self.q2(states, actions)
+        q1_loss = nn.functional.mse_loss(q1_pred, target_q)
+        q2_loss = nn.functional.mse_loss(q2_pred, target_q)
+
+        self.q1_opt.zero_grad()
+        q1_loss.backward()
+        nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
+        self.q1_opt.step()
+
+        self.q2_opt.zero_grad()
+        q2_loss.backward()
+        nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
+        self.q2_opt.step()
+
+        # Policy loss
+        new_actions, logp = self.policy.sample(states)
+        new_actions_env = self._rescale_action(new_actions)
+        q1_new = self.q1(states, new_actions_env)
+        q2_new = self.q2(states, new_actions_env)
+        q_new = torch.min(q1_new, q2_new)
+        alpha_val = self.log_alpha.exp()
+        policy_loss = (alpha_val * logp - q_new).mean()
+
+        self.policy_opt.zero_grad()
+        policy_loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        self.policy_opt.step()
+
+        # Temperature loss
+        alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+        self.alpha_opt.zero_grad()
+        alpha_loss.backward()
+        self.alpha_opt.step()
+        self.alpha = float(self.log_alpha.exp().item())
+
+        # Targets
+        soft_update(self.q1_target, self.q1, self.cfg.tau)
+        soft_update(self.q2_target, self.q2, self.cfg.tau)
+
+    def train(self):
+        cfg = self.cfg
+        env = self.env
+
+        episode_returns = []
+        episode_env_returns = []
+
+        obs, _ = env.reset(seed=cfg.seed)
+        state = self._obs_to_state(obs)
+        self.prev_ell = float(obs["state"][4])
+        ep_ret = 0.0
+        ep_env_ret = 0.0
+        ep_len = 0
+
+        for t in range(cfg.total_steps):
+            if cfg.render and env.render_mode == "human":
+                env.render()
+
+            if t < cfg.start_steps:
+                action = env.action_space.sample().astype(np.float32)
+            else:
+                action = self.select_action(state, deterministic=False)
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            next_state = self._obs_to_state(next_obs)
+            shaped_reward = self._shape_reward(obs, next_obs, float(reward), info)
+
+            done = bool(terminated or truncated)
+            self.replay.store(state, action, shaped_reward, next_state, done)
+
+            state = next_state
+            obs = next_obs
+            ep_ret += shaped_reward
+            ep_env_ret += float(reward)
+            ep_len += 1
+
+            if t >= cfg.update_after and t % cfg.update_every == 0:
+                for _ in range(cfg.updates_per_step):
+                    self.update()
+
+            timeout = ep_len >= cfg.max_ep_len
+            if done or timeout:
+                episode_returns.append(ep_ret)
+                episode_env_returns.append(ep_env_ret)
+                print(
+                    f"[SAC] Ep {len(episode_returns):4d} | step={t+1:7d} | "
+                    f"shaped_return={ep_ret:8.2f} | env_return={ep_env_ret:7.2f} | "
+                    f"len={ep_len:4d} | alpha={self.alpha:.3f}"
+                )
+                obs, _ = env.reset()
+                state = self._obs_to_state(obs)
+                self.prev_ell = float(obs["state"][4])
+                ep_ret = 0.0
+                ep_env_ret = 0.0
+                ep_len = 0
+
+        env.close()
+        return episode_returns, episode_env_returns
+
+
+def make_env(render_mode=None, seed=0, max_episode_steps=3000):
     env = CarRacing(
-        render_mode="human",
+        render_mode=render_mode,
         continuous=True,
         lap_complete_percent=0.95,
         reward_shaping=True,
-        max_episode_steps=max_steps,
+        max_episode_steps=max_episode_steps,
+    )
+    env.reset(seed=seed)
+    return env
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--total-steps", type=int, default=300000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-episode-steps", type=int, default=3000)
+    parser.add_argument("--render", action="store_true", help="Enable human render while training")
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    render_mode = "human" if args.render else None
+    # render_mode = "human" 
+    env = make_env(render_mode=render_mode, seed=args.seed, max_episode_steps=args.max_episode_steps)
+
+    cfg = SACConfig(
+        total_steps=args.total_steps,
+        max_ep_len=args.max_episode_steps,
+        seed=args.seed,
+        render=args.render,
     )
 
-    # Use only the low-dimensional state branch
-    state_dim = env.observation_space["state"].shape[0]
-    action_dim = env.action_space.shape[0]
+    agent = SACCarRacingAgent(env, cfg)
+    episode_returns, _ = agent.train()
 
-    # Action bounds from env
-    action_low = torch.tensor(env.action_space.low, device=device, dtype=torch.float32)
-    action_high = torch.tensor(env.action_space.high, device=device, dtype=torch.float32)
+    if len(episode_returns) > 0:
+        returns_arr = np.asarray(episode_returns, dtype=np.float32)
+        plt.figure()
+        plt.plot(returns_arr, label="Episode return")
+        window = max(1, len(returns_arr) // 20)
+        if window > 1:
+            kernel = np.ones(window) / float(window)
+            smooth = np.convolve(returns_arr, kernel, mode="valid")
+            plt.plot(np.arange(window - 1, len(returns_arr)), smooth, label="Moving avg")
 
-    # Seeding
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    # Networks
-    policy_net = GaussianPolicy(state_dim, action_dim).to(device)
-    q1_net = QNetwork(state_dim, action_dim).to(device)
-    q2_net = QNetwork(state_dim, action_dim).to(device)
-    q1_target = QNetwork(state_dim, action_dim).to(device)
-    q2_target = QNetwork(state_dim, action_dim).to(device)
-
-    q1_target.load_state_dict(q1_net.state_dict())
-    q2_target.load_state_dict(q2_net.state_dict())
-
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr)
-    q1_optimizer = optim.Adam(q1_net.parameters(), lr=lr)
-    q2_optimizer = optim.Adam(q2_net.parameters(), lr=lr)
-
-    # Entropy temperature
-    if auto_alpha:
-        target_entropy = -float(action_dim)   # recommended default
-        log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
-        alpha_optimizer = optim.Adam([log_alpha], lr=lr)
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.title("SAC on Custom CarRacing")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("sac_car_racing_returns.png", dpi=150)
+        plt.close()
     else:
-        log_alpha = torch.tensor(np.log(alpha), device=device)
-        alpha_optimizer = None
-    alpha = log_alpha.exp().item()
+        print("No completed episodes -> nothing to plot.")
 
-    replay_buffer = ReplayBuffer(replay_size, state_dim, action_dim)
-
-    total_steps = 0
-
-    def select_action(state_np, eval_mode=False):
-        state_tensor = torch.from_numpy(state_np).float().unsqueeze(0).to(device)
-        if (not eval_mode) and (total_steps < start_steps):
-            # use random policy at the start
-            action = env.action_space.sample()
-            return action.astype(np.float32)
-
-        with torch.no_grad():
-            if eval_mode:
-                a = policy_net.sample_deterministic(state_tensor)
-            else:
-                a, _, _ = policy_net.sample(state_tensor)
-
-        # a is in [-1, 1], rescale to env bounds
-        a = a.squeeze(0)
-        scaled = action_low + (a + 1.0) * 0.5 * (action_high - action_low)
-        return scaled.cpu().numpy().astype(np.float32)
-
-    # Training
-    for episode in range(1, num_episodes + 1):
-        obs, info = env.reset(seed=seed + episode)
-        state = obs["state"]
-        episode_return = 0.0
-        episode_steps = 0
-
-        for t in range(max_steps):
-            env.render()
-            total_steps += 1
-            episode_steps += 1
-
-            # --- Collect experience ---
-            action = select_action(state, eval_mode=False)
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            next_state = next_obs["state"]
-            done = terminated or truncated
-
-            replay_buffer.push(state, action, reward, next_state, done)
-            state = next_state
-            episode_return += reward
-
-            # --- Update networks ---
-            if len(replay_buffer) >= batch_size:
-                for _ in range(updates_per_step):
-                    states, actions, rewards, next_states, dones = replay_buffer.sample(
-                        batch_size, device
-                    )
-                    rewards = rewards.unsqueeze(1)
-                    dones = dones.unsqueeze(1)
-
-                    # 1. Compute target Q values
-                    with torch.no_grad():
-                        next_actions, next_log_probs, _ = policy_net.sample(next_states)
-                        # Rescale actions to env bounds
-                        na = action_low + (next_actions + 1.0) * 0.5 * (action_high - action_low)
-
-                        q1_next = q1_target(next_states, na)
-                        q2_next = q2_target(next_states, na)
-                        q_next_min = torch.min(q1_next, q2_next)
-                        alpha_val = log_alpha.exp() if auto_alpha else log_alpha.exp()
-                        target_q = rewards + gamma * (1.0 - dones) * (
-                            q_next_min - alpha_val * next_log_probs
-                        )
-
-                    # 2. Q1, Q2 losses
-                    q1 = q1_net(states, actions)
-                    q2 = q2_net(states, actions)
-                    q1_loss = nn.MSELoss()(q1, target_q)
-                    q2_loss = nn.MSELoss()(q2, target_q)
-
-                    q1_optimizer.zero_grad()
-                    q1_loss.backward()
-                    q1_optimizer.step()
-
-                    q2_optimizer.zero_grad()
-                    q2_loss.backward()
-                    q2_optimizer.step()
-
-                    # 3. Policy loss
-                    new_actions, log_probs, _ = policy_net.sample(states)
-                    na2 = action_low + (new_actions + 1.0) * 0.5 * (action_high - action_low)
-
-                    q1_pi = q1_net(states, na2)
-                    q2_pi = q2_net(states, na2)
-                    q_pi_min = torch.min(q1_pi, q2_pi)
-
-                    alpha_val = log_alpha.exp() if auto_alpha else log_alpha.exp()
-                    policy_loss = (alpha_val * log_probs - q_pi_min).mean()
-
-                    policy_optimizer.zero_grad()
-                    policy_loss.backward()
-                    policy_optimizer.step()
-
-                    # 4. Temperature (alpha) loss
-                    if auto_alpha:
-                        alpha_loss = (
-                            -log_alpha * (log_probs + target_entropy).detach()
-                        ).mean()
-                        alpha_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        alpha_optimizer.step()
-
-                    alpha = log_alpha.exp().item()
-
-                    # 5. Soft update target networks
-                    soft_update(q1_target, q1_net, tau)
-                    soft_update(q2_target, q2_net, tau)
-
-            if done:
-                break
-
-        print(
-            f"Episode {episode:4d} | Return = {episode_return:7.2f} | "
-            f"Steps = {episode_steps:4d} | TotalSteps = {total_steps:7d} | alpha={alpha:.3f}"
-        )
-
-    env.close()
-    # Save models (policy is the main one you care about)
-    torch.save(policy_net.state_dict(), "sac_car_racing_policy.pth")
-    torch.save(q1_net.state_dict(), "sac_car_racing_q1.pth")
-    torch.save(q2_net.state_dict(), "sac_car_racing_q2.pth")
-    print("Training finished, models saved (policy + Q networks).")
 
 if __name__ == "__main__":
-    train_sac()
+    main()

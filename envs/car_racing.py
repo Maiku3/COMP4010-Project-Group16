@@ -666,7 +666,4 @@ class _GaugeWindow:
             self.window.close()
         except Exception:
             pass
-    
-    # TODO: Implement pitstop rendering
 
-    # TODO: Implement a controller

@@ -18,6 +18,36 @@ from torch.distributions import Normal
 
 from envs.car_racing import CarRacing
 
+class RunningNorm:
+    """Track running mean/std for normalization."""
+
+    def __init__(self, shape, eps=1e-4):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps
+
+    def update(self, x: np.ndarray):
+        x = np.asarray(x, dtype=np.float64)
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x: np.ndarray):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
 
 def discount_cumsum(x, discount):
     # output[k] = x[k] + discount * x[k+1] + discount^2 * x[k+2] + ...
@@ -121,7 +151,7 @@ class ActorCritic(nn.Module):
 
     def _distribution(self, obs):
         mu = self.pi_net(obs)
-        std = torch.exp(self.log_std)
+        std = torch.exp(self.log_std).clamp(1e-3, 2.0)
         return Normal(mu, std)
 
     def _value(self, obs):
@@ -178,11 +208,16 @@ class PPOConfig:
     clip_ratio: float = 0.2
     pi_lr: float = 3e-4
     vf_lr: float = 1e-3
-    train_pi_iters: int = 80
-    train_v_iters: int = 80
+    train_pi_iters: int = 10
+    train_v_iters: int = 10
+    minibatch_size: int = 256
     target_kl: float = 0.01
     max_ep_len: int = 100000
     entropy_coef: float = 0.01
+    reward_clip: float = 50.0
+    max_grad_norm: float = 0.5
+    vf_clip_param: float = 0.2
+    lr_anneal: bool = True
 
 
 class PPOCarRacingAgent:
@@ -200,10 +235,22 @@ class PPOCarRacingAgent:
         action_low = env.action_space.low
         action_high = env.action_space.high
 
+        self.state_low = np.asarray(
+            env.observation_space["state"].low, dtype=np.float32
+        )
+        self.state_high = np.asarray(
+            env.observation_space["state"].high, dtype=np.float32
+        )
+        self.state_scale = np.maximum(self.state_high - self.state_low, 1e-3)
+        self.state_rms = RunningNorm(self.state_low.shape)
+
         self.ac = ActorCritic(state_dim, action_low, action_high).to(self.device)
 
-        self.pi_optimizer = optim.Adam(self.ac.parameters(), lr=self.cfg.pi_lr)
-        self.vf_optimizer = optim.Adam(self.ac.parameters(), lr=self.cfg.vf_lr)
+        pi_params = list(self.ac.pi_net.parameters()) + [self.ac.log_std]
+        vf_params = list(self.ac.v_net.parameters())
+
+        self.pi_optimizer = optim.Adam(pi_params, lr=self.cfg.pi_lr)
+        self.vf_optimizer = optim.Adam(vf_params, lr=self.cfg.vf_lr)
 
         self.buf = PPOBuffer(
             obs_dim=state_dim,
@@ -222,9 +269,12 @@ class PPOCarRacingAgent:
         self.speed_coef = 0.05
         self.prev_ell = 0.0
 
-    @staticmethod
-    def _obs_to_state(obs):
-        return np.asarray(obs["state"], dtype=np.float32)
+    def _obs_to_state(self, obs):
+        state = np.asarray(obs["state"], dtype=np.float32)
+        state = np.clip(state, self.state_low, self.state_high)
+        self.state_rms.update(state)
+        normed = self.state_rms.normalize(state)
+        return np.clip(normed, -5.0, 5.0)
 
     def _shape_reward(self, obs, next_obs, env_reward: float, info: dict | None):
         if info is None:
@@ -243,8 +293,16 @@ class PPOCarRacingAgent:
         pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
 
         shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r
+        shaped = np.clip(shaped, -self.cfg.reward_clip, self.cfg.reward_clip)
         self.prev_ell = ell
         return float(shaped)
+
+    def _set_lr(self, lr_mult: float):
+        lr_mult = max(0.0, lr_mult)
+        for pg in self.pi_optimizer.param_groups:
+            pg["lr"] = self.cfg.pi_lr * lr_mult
+        for pg in self.vf_optimizer.param_groups:
+            pg["lr"] = self.cfg.vf_lr * lr_mult
 
     def update(self):
         data = self.buf.get()
@@ -254,35 +312,62 @@ class PPOCarRacingAgent:
         ret = data["ret"].to(self.device)
         adv = data["adv"].to(self.device)
         logp_old = data["logp"].to(self.device)
+        val_old = data["val"].to(self.device)
 
+        buffer_size = obs.shape[0]
+        batch_size = min(self.cfg.minibatch_size, buffer_size)
+
+        # === Policy update with shuffled minibatches ===
+        stop_pi = False
         for _ in range(self.cfg.train_pi_iters):
-            logp, entropy, value = self.ac.evaluate(obs, act)
-            ratio = torch.exp(logp - logp_old)
+            idx = torch.randperm(buffer_size, device=self.device)
+            for start in range(0, buffer_size, batch_size):
+                mb_idx = idx[start : start + batch_size]
+                logp, entropy, _ = self.ac.evaluate(obs[mb_idx], act[mb_idx])
+                ratio = torch.exp(logp - logp_old[mb_idx])
 
-            obj1 = ratio * adv
-            obj2 = torch.clamp(
-                ratio, 1.0 - self.cfg.clip_ratio, 1.0 + self.cfg.clip_ratio
-            ) * adv
-            entropy_bonus = self.cfg.entropy_coef * entropy.mean()
-            pi_loss = -(torch.min(obj1, obj2).mean() + entropy_bonus)
+                obj1 = ratio * adv[mb_idx]
+                obj2 = torch.clamp(
+                    ratio, 1.0 - self.cfg.clip_ratio, 1.0 + self.cfg.clip_ratio
+                ) * adv[mb_idx]
+                entropy_bonus = self.cfg.entropy_coef * entropy.mean()
+                pi_loss = -(torch.min(obj1, obj2).mean() + entropy_bonus)
 
-            approx_kl = (logp_old - logp).mean().item()
-            if approx_kl > 1.5 * self.cfg.target_kl:
+                approx_kl = (logp_old[mb_idx] - logp).mean().item()
+                if approx_kl > 1.5 * self.cfg.target_kl:
+                    stop_pi = True
+                    break
+
+                self.pi_optimizer.zero_grad()
+                pi_loss.backward()
+                nn.utils.clip_grad_norm_(self.ac.parameters(), self.cfg.max_grad_norm)
+                self.pi_optimizer.step()
+
+            if stop_pi:
                 break
 
-            self.pi_optimizer.zero_grad()
-            pi_loss.backward()
-            nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
-            self.pi_optimizer.step()
-
+        # === Value update ===
         for _ in range(self.cfg.train_v_iters):
-            _, _, value = self.ac.evaluate(obs, act)
-            v_loss = ((value - ret) ** 2).mean()
+            idx = torch.randperm(buffer_size, device=self.device)
+            for start in range(0, buffer_size, batch_size):
+                mb_idx = idx[start : start + batch_size]
+                value = self.ac._value(obs[mb_idx])
+                if self.cfg.vf_clip_param > 0.0:
+                    v_pred_clipped = val_old[mb_idx] + torch.clamp(
+                        value - val_old[mb_idx],
+                        -self.cfg.vf_clip_param,
+                        self.cfg.vf_clip_param,
+                    )
+                    v_loss_unclipped = (value - ret[mb_idx]) ** 2
+                    v_loss_clipped = (v_pred_clipped - ret[mb_idx]) ** 2
+                    v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    v_loss = ((value - ret[mb_idx]) ** 2).mean()
 
-            self.vf_optimizer.zero_grad()
-            v_loss.backward()
-            nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
-            self.vf_optimizer.step()
+                self.vf_optimizer.zero_grad()
+                v_loss.backward()
+                nn.utils.clip_grad_norm_(self.ac.parameters(), self.cfg.max_grad_norm)
+                self.vf_optimizer.step()
 
     def train(self):
         cfg = self.cfg
@@ -302,11 +387,15 @@ class PPOCarRacingAgent:
         total_steps = cfg.steps_per_epoch * cfg.epochs
 
         for epoch in range(cfg.epochs):
+            if cfg.lr_anneal:
+                lr_mult = 1.0 - (epoch / float(cfg.epochs))
+                self._set_lr(lr_mult)
             for t in range(cfg.steps_per_epoch):
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                 act, val, logp = self.ac.step(obs_t)
+                action_np = np.asarray(act, dtype=np.float32)
 
-                next_full_obs, reward, terminated, truncated, info = env.step(act)
+                next_full_obs, reward, terminated, truncated, info = env.step(action_np)
                 next_obs = self._obs_to_state(next_full_obs)
 
                 shaped_reward = self._shape_reward(full_obs, next_full_obs, float(reward), info)
@@ -367,7 +456,7 @@ def make_env(render_mode=None, seed=0, max_episode_steps=100000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--steps-per-epoch", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-episode-steps", type=int, default=100000)
@@ -413,7 +502,7 @@ def main():
             plt.plot(
                 np.arange(window - 1, len(returns_arr)),
                 smooth,
-                label=f"Moving avg (window={window})",
+                label="Moving avg",
             )
 
         plt.xlabel("Episode")
