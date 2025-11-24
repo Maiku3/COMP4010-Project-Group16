@@ -367,7 +367,7 @@ def make_env(render_mode=None, seed=0, max_episode_steps=100000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=10000)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-episode-steps", type=int, default=100000)
