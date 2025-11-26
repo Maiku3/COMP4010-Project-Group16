@@ -53,21 +53,37 @@ def discretize_action_space(action_space, bins_per_dim=(7, 3, 2, 2)):
     return actions
 
 
-class QNetwork(nn.Module):
+class DuelingQNetwork(nn.Module):
     def __init__(self, state_dim: int, num_actions: int):
         super().__init__()
         hidden = 256
 
-        self.net = nn.Sequential(
+        self.feature = nn.Sequential(
             nn.Linear(state_dim, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+
+        self.advantage = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, num_actions),
         )
 
+        self.value = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x) 
+        feat = self.feature(x)
+        adv = self.advantage(feat)
+        val = self.value(feat)
+        adv_mean = adv.mean(dim=1, keepdim=True)
+        q = val + (adv - adv_mean)
+        return q
 
 
 class DQNCarRacingAgent:
@@ -82,8 +98,9 @@ class DQNCarRacingAgent:
         min_replay_size: int = 1000,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
-        epsilon_decay_steps: int = 10000,
+        epsilon_decay_steps: int = 50000,
         target_update_freq: int = 1000,
+        reward_clip: float = 50.0,
         device: torch.device | None = None,
     ):
         self.env = env
@@ -93,6 +110,7 @@ class DQNCarRacingAgent:
         self.replay_capacity = replay_capacity
         self.min_replay_size = min_replay_size
         self.target_update_freq = target_update_freq
+        self.reward_clip = reward_clip
 
         # Device
         if device is None:
@@ -106,8 +124,8 @@ class DQNCarRacingAgent:
         self.num_actions = self.actions_table.shape[0]
 
         # Q network + target network
-        self.q_net = QNetwork(state_dim, self.num_actions).to(self.device)
-        self.target_q_net = QNetwork(state_dim, self.num_actions).to(self.device)
+        self.q_net = DuelingQNetwork(state_dim, self.num_actions).to(self.device)
+        self.target_q_net = DuelingQNetwork(state_dim, self.num_actions).to(self.device)
         self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.target_q_net.eval()
 
@@ -120,6 +138,7 @@ class DQNCarRacingAgent:
         self.epsilon_end = epsilon_end
         self.epsilon_decay_steps = epsilon_decay_steps
         self.global_step = 0
+        self.gradient_steps = 0
 
         # Reward shaping knobs
         self.progress_coef = 60.0
@@ -169,6 +188,7 @@ class DQNCarRacingAgent:
         pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
 
         shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r
+        shaped = np.clip(shaped, -self.reward_clip, self.reward_clip)
         self.prev_ell = ell
         return float(shaped)
 
@@ -183,27 +203,29 @@ class DQNCarRacingAgent:
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(-1)
         next_states_t = torch.tensor(next_states, dtype=torch.float32, device=self.device)
         terminated_t = torch.tensor(terminated, dtype=torch.float32, device=self.device).unsqueeze(-1)
-        truncated_t = torch.tensor(truncated, dtype=torch.float32, device=self.device).unsqueeze(-1)
         # Q(s,a) for current network
         q_all = self.q_net(states_t)
         q_sa = q_all.gather(1, action_idx_t.unsqueeze(-1))
 
         # target Q(s',a')
         with torch.no_grad():
-            q_next_all = self.target_q_net(next_states_t)
-            q_next_max, _ = torch.max(q_next_all, dim=1, keepdim=True)
+            # Double DQN target: select action with online net, evaluate with target net
+            q_next_online = self.q_net(next_states_t)
+            next_action = torch.argmax(q_next_online, dim=1, keepdim=True)
+            q_next_target = self.target_q_net(next_states_t).gather(1, next_action)
 
             bootstrap_mask = 1.0 - terminated_t
-            target = rewards_t + self.gamma * bootstrap_mask * q_next_max
+            target = rewards_t + self.gamma * bootstrap_mask * q_next_target
 
-        loss = nn.functional.mse_loss(q_sa, target)
+        loss = nn.functional.smooth_l1_loss(q_sa, target)
 
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
-        if self.global_step % self.target_update_freq == 0:
+        self.gradient_steps += 1
+        if self.gradient_steps % self.target_update_freq == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
 
     def train(self, total_timesteps: int):
@@ -261,7 +283,7 @@ def make_env(render_mode=None, seed: int = 0, max_episode_steps: int = 100000) -
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total-timesteps", type=int, default=100000)
+    parser.add_argument("--total-timesteps", type=int, default=500000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--bins",
@@ -310,7 +332,7 @@ def main():
             plt.plot(
                 np.arange(window - 1, len(returns_arr)),
                 smooth,
-                label=f"Moving avg (window={window})",
+                label="Moving avg",
             )
 
         plt.xlabel("Episode")
