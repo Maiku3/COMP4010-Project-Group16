@@ -68,6 +68,20 @@ class CarRacing(gym.Env):
         self.wear_brake_per_s = 0.0030        # additional at brake=1
         self.wear_steer_per_s = 0.0020        # additional at steer=1
 
+        # ===== Resource thresholds & shaping =====
+        # Termination thresholds
+        self.fuel_empty_threshold = 0.02    # below ~2% fuel -> out of fuel
+        self.wear_max_threshold = 0.98      # above ~98% wear -> tire failure
+
+        # One-time penalties when we actually fail due to resources
+        self.fuel_empty_penalty = 30.0
+        self.wear_max_penalty = 20.0
+
+        # Small per-step cost for using resources (only applied if reward_shaping=True)
+        self.fuel_cost_per_unit = 2.0       # cost * (fuel_before - fuel_after)
+        self.wear_cost_per_unit = 1.0       # cost * (wear_after - wear_before)
+        # ========================================
+
         # Speed scaling reference (m/s); above this speed, scaling is 1.0
         self.speed_ref_mps = 40.0 # Will need to adjust based on testing
 
@@ -97,7 +111,7 @@ class CarRacing(gym.Env):
 
         # ==== How much wear impacts steering and gas ====
         self.steering_grip_min = 0.3      # min grip at wear=1.0 (30% of steering)
-        self.steering_wear_strength = 0.0 # 1.0 = full effect, < 1.0 = weaker effect
+        self.steering_wear_strength = 1 # 1.0 = full effect, < 1.0 = weaker effect
 
         # Multi-lap state
         self.max_laps = max(1, int(max_laps))
@@ -151,8 +165,9 @@ class CarRacing(gym.Env):
         velocity = self._get_velocity()
         # print(f"Velocity: {velocity:.2f} | Fuel: {self._fuel:.3f} | Wear: {self._wear:.3f}")
 
-        # Update resources
-        steer, gas, brake = float(base_action[0]), float(base_action[1]), float(base_action[2])
+        # ==== Resource updates (fuel + wear) ====
+        fuel_before = self._fuel
+        wear_before = self._wear
         
         # Scale effects by speed (0.3 at standstill to 1.0 at speed_ref and above)
         speed_scale = 0.3 + 0.7 * min(1.0, velocity / self.speed_ref_mps)
@@ -171,6 +186,24 @@ class CarRacing(gym.Env):
         wear_rate_per_s *= speed_scale
         self._wear = min(1.0, self._wear + self._dt * wear_rate_per_s)
 
+        fuel_used = max(0.0, fuel_before - self._fuel)
+        wear_added = max(0.0, self._wear - wear_before)
+
+        # ==== Resource-based termination conditions ====
+        out_of_fuel = (self._fuel <= self.fuel_empty_threshold)
+        tires_gone = (self._wear >= self.wear_max_threshold)
+
+        if out_of_fuel:
+            terminated = True
+            if self._reward_shaping:
+                reward -= self.fuel_empty_penalty
+
+        if tires_gone:
+            terminated = True
+            if self._reward_shaping:
+                reward -= self.wear_max_penalty
+
+        # ==== Multi-lap logic ====
         # per-lap progress on the current track
         ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
 
@@ -254,6 +287,10 @@ class CarRacing(gym.Env):
         info["pit_executed"] = pit_executed
         info["ell"] = float(ell_t)
         info["d_t"] = float(d_t)
+        info["out_of_fuel"] = bool(out_of_fuel)
+        info["tires_gone"] = bool(tires_gone)
+        info["fuel"] = float(self._fuel)
+        info["wear"] = float(self._wear)
 
         # Update observation
         return self._get_obs(observation), reward, terminated, truncated, info
