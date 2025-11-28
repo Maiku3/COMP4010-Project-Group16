@@ -186,8 +186,13 @@ class CarRacing(gym.Env):
         wear_rate_per_s *= speed_scale
         self._wear = min(1.0, self._wear + self._dt * wear_rate_per_s)
 
-        fuel_used = max(0.0, fuel_before - self._fuel)
-        wear_added = max(0.0, self._wear - wear_before)
+        # fuel_used = max(0.0, fuel_before - self._fuel)
+        # wear_added = max(0.0, self._wear - wear_before)
+
+        # # Optional per-step shaping: small penalty for burning fuel / tires
+        # if self._reward_shaping:
+        #     reward -= self.fuel_cost_per_unit * fuel_used
+        #     reward -= self.wear_cost_per_unit * wear_added
 
         # ==== Resource-based termination conditions ====
         out_of_fuel = (self._fuel <= self.fuel_empty_threshold)
@@ -324,6 +329,8 @@ class CarRacing(gym.Env):
         # Base CarRacing expects only 3 controls, so we keep 'pit' separate
         if self.continuous:
             a = np.asarray(action, dtype=np.float32)
+            if a.shape[0] < 4:
+                a = np.concatenate([a, np.array([0.0], dtype=np.float32)], axis=0)
             steer = float(np.clip(a[0], -1.0, 1.0))
             gas   = float(np.clip(a[1],  0.0, 1.0))
             brake = float(np.clip(a[2],  0.0, 1.0))
@@ -338,7 +345,8 @@ class CarRacing(gym.Env):
             # Throttle (acceleration) also affected by grip
             gas *= grip
 
-            return np.array([steer, gas, brake], dtype=np.float32), pit
+            base = np.array([steer, gas, brake], dtype=np.float32)
+            return base, pit
         else:
             a = int(action)
             pit = (a == 5)
