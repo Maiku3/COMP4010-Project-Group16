@@ -1,5 +1,6 @@
 # https://medium.com/@samina.amin/deep-q-learning-dqn-71c109586bae
 import argparse
+from datetime import datetime
 import itertools
 import random
 from collections import deque
@@ -326,6 +327,10 @@ def main():
     parser.add_argument("--save-every-episodes", type=int, default=50)
     args = parser.parse_args()
 
+    # Generate a unique timestamp for the training run
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_checkpoint_dir = os.path.join(args.checkpoint_dir, f"run_{timestamp}")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -348,14 +353,14 @@ def main():
 
     episode_returns = agent.train(
         total_timesteps=args.total_timesteps,
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=run_checkpoint_dir,
         save_every_episodes=args.save_every_episodes,
     )
     env.close()
 
         # Final checkpoint
     if len(episode_returns) > 0:
-        final_ckpt_path = os.path.join(args.checkpoint_dir, "dqn_carracing_final.pt")
+        final_ckpt_path = os.path.join(run_checkpoint_dir, "dqn_carracing_final.pt")
         agent.save_checkpoint(final_ckpt_path, episode=len(episode_returns), episode_returns=episode_returns)
         print(f"[DQN] Final checkpoint saved to {final_ckpt_path}")
 
