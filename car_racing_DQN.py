@@ -3,6 +3,7 @@ import argparse
 import itertools
 import random
 from collections import deque
+import os
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -149,6 +150,23 @@ class DQNCarRacingAgent:
         self.speed_coef = 0.05
         self.prev_ell = 0.0
 
+    # ===== saving ======
+
+    def save_checkpoint(self, checkpoint_path: str, episode: int, episode_returns):
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        ckpt = {
+            "episode": episode,
+            "global_step": self.global_step,
+            "gradient_steps": self.gradient_steps,
+            "q_net_state_dict": self.q_net.state_dict(),
+            "target_q_net_state_dict": self.target_q_net.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "epsilon": self.epsilon,
+            "episode_returns": episode_returns,
+            "actions_table": self.actions_table,
+        }
+        torch.save(ckpt, checkpoint_path)
+        print(f"[DQN] Saved checkpoint to {checkpoint_path}")
     @staticmethod
     def _obs_to_state(obs) -> np.ndarray:
         return np.asarray(obs["state"], dtype=np.float32)
@@ -228,7 +246,7 @@ class DQNCarRacingAgent:
         if self.gradient_steps % self.target_update_freq == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
 
-    def train(self, total_timesteps: int):
+    def train(self, total_timesteps: int, checkpoint_dir: str | None = None, save_every_episodes: int | None = None):
         obs, _ = self.env.reset()
         state = self._obs_to_state(obs)
         self.prev_ell = float(obs["state"][4])
@@ -266,6 +284,15 @@ class DQNCarRacingAgent:
                 episode_reward = 0.0
                 episode_env_reward = 0.0
 
+                # Periodic checkpoint saving
+                if checkpoint_dir is not None and save_every_episodes is not None:
+                    if episode % save_every_episodes == 0:
+                        ckpt_path = os.path.join(
+                            checkpoint_dir,
+                            f"dqn_carracing_ep{episode}.pt",
+                        )
+                        self.save_checkpoint(ckpt_path, episode, episode_returns)
+
         return episode_returns
 
 
@@ -295,6 +322,8 @@ def main():
     )
     parser.add_argument("--max-episode-steps", type=int, default=100000)
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_dqn")
+    parser.add_argument("--save-every-episodes", type=int, default=50)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -310,13 +339,25 @@ def main():
         max_episode_steps=args.max_episode_steps,
     )
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent = DQNCarRacingAgent(
         env,
         bins_per_dim=tuple(args.bins),
+        device=device,
     )
 
-    episode_returns = agent.train(total_timesteps=args.total_timesteps)
+    episode_returns = agent.train(
+        total_timesteps=args.total_timesteps,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every_episodes=args.save_every_episodes,
+    )
     env.close()
+
+        # Final checkpoint
+    if len(episode_returns) > 0:
+        final_ckpt_path = os.path.join(args.checkpoint_dir, "dqn_carracing_final.pt")
+        agent.save_checkpoint(final_ckpt_path, episode=len(episode_returns), episode_returns=episode_returns)
+        print(f"[DQN] Final checkpoint saved to {final_ckpt_path}")
 
     # Plot and persist learning output for later comparison
     if len(episode_returns) > 0:
