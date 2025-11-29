@@ -131,7 +131,6 @@ class CarRacing(gym.Env):
 
         # reset lap counter
         self._current_lap = 1
-        info["lap"] = self._current_lap
         info["max_laps"] = self.max_laps
 
         # build static painted pit strips onto the track
@@ -226,6 +225,8 @@ class CarRacing(gym.Env):
             self._current_lap += 1
             info["lap_finished"] = True
             info["finished_lap"] = finished_lap
+            info["lap"] = self._current_lap
+
 
             # Reset underlying env to start the next lap
             observation, info_reset = self._env.reset()
@@ -270,7 +271,7 @@ class CarRacing(gym.Env):
             self._pit_lock_sector = None
 
         pit_executed = False
-        if pit_enter and (velocity < self._pit_speed_max):
+        if pit_enter and pit_command and (velocity < self._pit_speed_max):
             # only service if we haven't serviced this sector yet
             if self._pit_lock_sector is None or self._pit_lock_sector != sector_idx:
                 self._pit_lock_sector = sector_idx
@@ -279,6 +280,22 @@ class CarRacing(gym.Env):
                 pit_executed = True
                 print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
 
+        # Reward sensible pit-stops, mildly discourage pointless ones
+        if self._reward_shaping and pit_executed:
+            try:
+                fuel_before = info.get("fuel_before", None)
+                wear_before = info.get("wear_before", None)
+            except Exception:
+                fuel_before = None
+                wear_before = None
+
+            if (fuel_before is not None and fuel_before < 0.5) or (
+                wear_before is not None and wear_before > 0.5
+            ):
+                reward += 5.0   # “good” pit: it was actually needed
+            else:
+                reward -= 2.0   # pitting too early: small cost
+                
         # logs to check edges
         if pit_enter:
             print(f"[PIT] ENTER sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
