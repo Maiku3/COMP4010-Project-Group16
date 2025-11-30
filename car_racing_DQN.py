@@ -15,6 +15,38 @@ import torch.optim as optim
 
 from envs.car_racing import CarRacing
 
+class RunningMeanStd:
+    def __init__(self, shape, eps: float = 1e-4):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps
+
+    def update(self, x: np.ndarray):
+        x = np.asarray(x, dtype=np.float64)
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x: np.ndarray, clip_range: float = 5.0):
+        normed = (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+        if clip_range is not None:
+            normed = np.clip(normed, -clip_range, clip_range)
+        return normed
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.buffer = deque(maxlen=capacity)
@@ -36,6 +68,25 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+
+
+def curated_action_set():
+    actions = [
+        [-0.8, 0.8, 0.0, 0.0],  # hard left, throttle
+        [0.0, 0.8, 0.0, 0.0],   # straight, throttle
+        [0.8, 0.8, 0.0, 0.0],   # hard right, throttle
+        [-0.5, 0.4, 0.0, 0.0],  # medium left, light gas
+        [0.0, 0.4, 0.0, 0.0],   # coast with a little gas
+        [0.5, 0.4, 0.0, 0.0],   # medium right, light gas
+        [-0.8, 0.0, 0.0, 0.0],  # hard left coast
+        [0.0, 0.0, 0.0, 0.0],   # full coast
+        [0.8, 0.0, 0.0, 0.0],   # hard right coast
+        [0.0, 0.5, 0.7, 0.0],   # straight brake
+        [-0.6, 0.2, 0.8, 0.0],  # brake left
+        [0.6, 0.2, 0.8, 0.0],   # brake right
+        [0.0, 0.2, 0.0, 1.0],   # pit entry (slow, pit on)
+    ]
+    return np.asarray(actions, dtype=np.float32)
 
 def discretize_action_space(action_space, bins_per_dim=(7, 3, 2, 2)):
     low = action_space.low
@@ -101,7 +152,8 @@ class DQNCarRacingAgent:
         epsilon_end: float = 0.05,
         epsilon_decay_steps: int = 50000,
         target_update_freq: int = 1000,
-        reward_clip: float = 50.0,
+        reward_clip: float = 80.0,
+        use_curated_actions: bool = True,
         device: torch.device | None = None,
     ):
         self.env = env
@@ -121,7 +173,14 @@ class DQNCarRacingAgent:
 
         state_dim = env.observation_space["state"].shape[0]
 
-        self.actions_table = discretize_action_space(env.action_space, bins_per_dim)
+        self.state_low = np.asarray(env.observation_space["state"].low, dtype=np.float32)
+        self.state_high = np.asarray(env.observation_space["state"].high, dtype=np.float32)
+        self.state_rms = RunningMeanStd(self.state_low.shape)
+
+        if use_curated_actions:
+            self.actions_table = curated_action_set()
+        else:
+            self.actions_table = discretize_action_space(env.action_space, bins_per_dim)
         self.num_actions = self.actions_table.shape[0]
 
         # Q network + target network
@@ -148,10 +207,13 @@ class DQNCarRacingAgent:
         self.pit_bonus = 25.0
         self.speed_target = 35.0
         self.speed_coef = 0.05
+        self.heading_penalty = 1.2
+        self.lateral_penalty = 0.2
+        self.lap_bonus = 500.0
+        self.alive_bonus = 0.01
         self.prev_ell = 0.0
 
     # ===== saving ======
-
     def save_checkpoint(self, checkpoint_path: str, episode: int, episode_returns):
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         ckpt = {
@@ -170,6 +232,13 @@ class DQNCarRacingAgent:
     @staticmethod
     def _obs_to_state(obs) -> np.ndarray:
         return np.asarray(obs["state"], dtype=np.float32)
+
+    def _obs_to_state(self, obs) -> np.ndarray:
+        state = np.asarray(obs["state"], dtype=np.float32)
+        state = np.clip(state, self.state_low, self.state_high)
+        self.state_rms.update(state)
+        normed = self.state_rms.normalize(state, clip_range=5.0)
+        return normed
 
     def _update_epsilon(self):
         self.global_step += 1
@@ -196,6 +265,8 @@ class DQNCarRacingAgent:
         v_t = float(next_obs["state"][1])
         off_track = bool(next_obs["state"][2] > 0.5)
         ell = float(next_obs["state"][4])
+        heading_err = float(next_obs["state"][8])
+        lat_v = float(next_obs["state"][9])
 
         delta_ell = max(0.0, ell - self.prev_ell)
         progress_r = self.progress_coef * delta_ell
@@ -204,8 +275,22 @@ class DQNCarRacingAgent:
         speed_r = self.speed_coef * min(1.0, v_t / self.speed_target)
         offtrack_r = -self.offtrack_penalty if off_track else 0.0
         pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
+        heading_r = -self.heading_penalty * abs(heading_err)
+        lateral_r = -self.lateral_penalty * abs(lat_v)
+        lap_r = self.lap_bonus if info.get("lap_finished", False) else 0.0
 
-        shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r
+        shaped = (
+            env_reward
+            + progress_r
+            + center_r
+            + speed_r
+            + offtrack_r
+            + pit_r
+            + heading_r
+            + lateral_r
+            + lap_r
+            + self.alive_bonus
+        )
         shaped = np.clip(shaped, -self.reward_clip, self.reward_clip)
         self.prev_ell = ell
         return float(shaped)
@@ -221,6 +306,7 @@ class DQNCarRacingAgent:
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(-1)
         next_states_t = torch.tensor(next_states, dtype=torch.float32, device=self.device)
         terminated_t = torch.tensor(terminated, dtype=torch.float32, device=self.device).unsqueeze(-1)
+        truncated_t = torch.tensor(truncated, dtype=torch.float32, device=self.device).unsqueeze(-1)
         # Q(s,a) for current network
         q_all = self.q_net(states_t)
         q_sa = q_all.gather(1, action_idx_t.unsqueeze(-1))
@@ -232,8 +318,8 @@ class DQNCarRacingAgent:
             next_action = torch.argmax(q_next_online, dim=1, keepdim=True)
             q_next_target = self.target_q_net(next_states_t).gather(1, next_action)
 
-            bootstrap_mask = 1.0 - terminated_t
-            target = rewards_t + self.gamma * bootstrap_mask * q_next_target
+            done_mask = 1.0 - torch.clamp(terminated_t + truncated_t, 0.0, 1.0)
+            target = rewards_t + self.gamma * done_mask * q_next_target
 
         loss = nn.functional.smooth_l1_loss(q_sa, target)
 
@@ -246,7 +332,7 @@ class DQNCarRacingAgent:
         if self.gradient_steps % self.target_update_freq == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
 
-    def train(self, total_timesteps: int, checkpoint_dir: str | None = None, save_every_episodes: int | None = None):
+    def train(self, total_timesteps: int):
         obs, _ = self.env.reset()
         state = self._obs_to_state(obs)
         self.prev_ell = float(obs["state"][4])
@@ -276,8 +362,8 @@ class DQNCarRacingAgent:
             episode_done = bool(terminated or truncated)
             if episode_done:
                 episode += 1
-                episode_returns.append(episode_reward)
-                print(f"[DQN] Ep {episode} | step={t+1} | shaped_return={episode_reward:.2f} | env_return={episode_env_reward:.2f} | eps={self.epsilon:.3f} | terminated={terminated} truncated={truncated}")
+                episode_returns.append(episode_env_reward)
+                print(f"[DQN] Ep {episode} | step={t+1} | return={episode_env_reward:.2f} | eps={self.epsilon:.3f} | terminated={terminated} truncated={truncated}")
                 obs, _ = self.env.reset()
                 state = self._obs_to_state(obs)
                 self.prev_ell = float(obs["state"][4])
@@ -292,6 +378,8 @@ class DQNCarRacingAgent:
                             f"dqn_carracing_ep{episode}.pt",
                         )
                         self.save_checkpoint(ckpt_path, episode, episode_returns)
+
+
 
         return episode_returns
 
@@ -310,7 +398,7 @@ def make_env(render_mode=None, seed: int = 0, max_episode_steps: int = 100000) -
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total-timesteps", type=int, default=500000)
+    parser.add_argument("--total-timesteps", type=int, default=600000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--bins",
@@ -322,8 +410,11 @@ def main():
     )
     parser.add_argument("--max-episode-steps", type=int, default=100000)
     parser.add_argument("--render", action="store_true")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_dqn")
-    parser.add_argument("--save-every-episodes", type=int, default=50)
+    parser.add_argument(
+        "--grid-actions",
+        action="store_true",
+        help="Use full discretized action grid instead of curated 13-action set",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -339,10 +430,12 @@ def main():
         max_episode_steps=args.max_episode_steps,
     )
 
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent = DQNCarRacingAgent(
         env,
         bins_per_dim=tuple(args.bins),
+        use_curated_actions=not args.grid_actions,
         device=device,
     )
 
