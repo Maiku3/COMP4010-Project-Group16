@@ -3,7 +3,7 @@
 
 ## What has been done during the past two weeks?
 
-* **Hanyoung Chung**: 
+* **Hanyoung Chung**: Helped add a cnn method for PPO algorithm that takes in the image as well as the states to train the agent. [Pull Request #22](https://github.com/Maiku3/COMP4010-Project-Group16/pull/22). Helped created result demo video.
 
 * **Jaden Chang**: 
 
