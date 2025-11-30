@@ -254,6 +254,9 @@ class PPOCarRacingAgent:
         self.pit_bonus = 20.0
         self.speed_target = 45.0
         self.speed_coef = 0.15
+        self.heading_penalty = 2.5
+        self.lateral_penalty = 0.3
+        self.lap_bonus = 50.0
         self.alive_bonus = 0.02
         self.prev_ell = 0.0
         self.current_entropy_coef = self.cfg.entropy_coef
@@ -273,6 +276,8 @@ class PPOCarRacingAgent:
         v_t = float(next_obs["state"][1])
         off_track = bool(next_obs["state"][2] > 0.5)
         ell = float(next_obs["state"][4])
+        heading_err = float(next_obs["state"][8])
+        lat_v = float(next_obs["state"][9])
 
         delta_ell = max(0.0, ell - self.prev_ell)
         progress_r = self.progress_coef * delta_ell
@@ -280,8 +285,22 @@ class PPOCarRacingAgent:
         speed_r = self.speed_coef * min(1.0, v_t / self.speed_target)
         offtrack_r = -self.offtrack_penalty if off_track else 0.0
         pit_r = self.pit_bonus if info.get("pit_executed", False) else 0.0
+        heading_r = -self.heading_penalty * abs(heading_err)
+        lateral_r = -self.lateral_penalty * abs(lat_v)
+        lap_r = self.lap_bonus if info.get("lap_finished", False) else 0.0
 
-        shaped = env_reward + progress_r + center_r + speed_r + offtrack_r + pit_r + self.alive_bonus
+        shaped = (
+            env_reward
+            + progress_r
+            + center_r
+            + speed_r
+            + offtrack_r
+            + pit_r
+            + heading_r
+            + lateral_r
+            + lap_r
+            + self.alive_bonus
+        )
         shaped = np.clip(shaped, -self.cfg.reward_clip, self.cfg.reward_clip)
         if self.cfg.normalize_reward:
             self.rew_rms.update(np.asarray([shaped], dtype=np.float32))
@@ -413,7 +432,7 @@ class PPOCarRacingAgent:
                     self.buf.finish_path(last_val)
 
                     if terminal or timeout or bool(truncated):
-                        episode_returns.append(ep_ret)
+                        episode_returns.append(ep_env_ret)
                         episode_env_returns.append(ep_env_ret)
                         print(
                             f"[PPO] Ep {len(episode_returns)} | ep_len={ep_len} | shaped_return={ep_ret:.2f} "
@@ -448,8 +467,8 @@ def make_env(render_mode=None, seed=0, max_episode_steps=5000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--steps-per-epoch", type=int, default=10000)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--steps-per-epoch", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=5000)
     parser.add_argument("--render", action="store_true")
@@ -499,11 +518,11 @@ def main():
 
         plt.xlabel("Episode")
         plt.ylabel("Return")
-        plt.title("PPO-Clip V2 on Custom CarRacing")
+        plt.title("PPO on Custom CarRacing")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("ppo_car_racing_returns_v2.png", dpi=150)
+        plt.savefig("ppo_car_racing_returns.png", dpi=150)
         plt.close()
     else:
         print("No completed episodes -> nothing to plot.")
