@@ -284,6 +284,8 @@ class CarRacing(gym.Env):
         if not in_sector:
             self._pit_lock_sector = None
 
+        fuel_before_service = self._fuel
+        wear_before_service = self._wear
         pit_executed = False
         if pit_enter and pit_command and (velocity < self._pit_speed_max):
             # only service if we haven't serviced this sector yet
@@ -296,17 +298,8 @@ class CarRacing(gym.Env):
 
         # Reward sensible pit-stops, mildly discourage pointless ones
         if self._reward_shaping and pit_executed:
-            try:
-                fuel_before = info.get("fuel_before", None)
-                wear_before = info.get("wear_before", None)
-            except Exception:
-                fuel_before = None
-                wear_before = None
-
-            if (fuel_before is not None and fuel_before < 0.5) or (
-                wear_before is not None and wear_before > 0.5
-            ):
-                reward += 5.0   # “good” pit: it was actually needed
+            if (fuel_before_service < 0.5) or (wear_before_service > 0.5):
+                reward += 5.0   # reward only when pit was needed
             else:
                 reward -= 2.0   # pitting too early: small cost
 
@@ -391,7 +384,8 @@ class CarRacing(gym.Env):
             # Same grip logic for discrete mode
             grip = 1.0 - self.steering_wear_strength * self._wear
             grip = float(np.clip(grip, self.steering_grip_min, 1.0))
-            steer *= grip
+            steer = float(base[0]) * grip
+            base = np.array([steer, base[1], base[2]], dtype=np.float32)
 
             return base, pit
 
@@ -460,7 +454,7 @@ class CarRacing(gym.Env):
         # Signed lateral offset = projection of w onto the normal, 
         signed_distance = (vector_to_car_x * road_normal_x + vector_to_car_y * road_normal_y)
 
-        return float(np.clip(signed_distance, -5.0, 5.0))
+        return float(signed_distance)
 
     def _compute_lookahead_curvature(self):
         """
