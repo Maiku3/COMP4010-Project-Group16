@@ -333,7 +333,7 @@ class DQNCarRacingAgent:
         if self.gradient_steps % self.target_update_freq == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
 
-    def train(self, total_timesteps: int):
+    def train(self, total_timesteps: int, checkpoint_dir: str | None = None, save_every_episodes: int | None = None):
         obs, _ = self.env.reset()
         state = self._obs_to_state(obs)
         self.prev_ell = float(obs["state"][4])
