@@ -69,6 +69,20 @@ class CarRacing(gym.Env):
         self.wear_brake_per_s = 0.0030        # additional at brake=1
         self.wear_steer_per_s = 0.0020        # additional at steer=1
 
+        # ===== Resource thresholds & shaping =====
+        # Termination thresholds
+        self.fuel_empty_threshold = 0.02    # below ~2% fuel -> out of fuel
+        self.wear_max_threshold = 0.98      # above ~98% wear -> tire failure
+
+        # One-time penalties when we actually fail due to resources
+        self.fuel_empty_penalty = 30.0
+        self.wear_max_penalty = 20.0
+
+        # Small per-step cost for using resources (only applied if reward_shaping=True)
+        self.fuel_cost_per_unit = 2.0       # cost * (fuel_before - fuel_after)
+        self.wear_cost_per_unit = 1.0       # cost * (wear_after - wear_before)
+        # ========================================
+
         # Speed scaling reference (m/s); above this speed, scaling is 1.0
         self.speed_ref_mps = 40.0 # Will need to adjust based on testing
 
@@ -172,6 +186,29 @@ class CarRacing(gym.Env):
         wear_rate_per_s *= speed_scale
         self._wear = min(1.0, self._wear + self._dt * wear_rate_per_s)
 
+        # fuel_used = max(0.0, fuel_before - self._fuel)
+        # wear_added = max(0.0, self._wear - wear_before)
+
+        # # Optional per-step shaping: small penalty for burning fuel / tires
+        # if self._reward_shaping:
+        #     reward -= self.fuel_cost_per_unit * fuel_used
+        #     reward -= self.wear_cost_per_unit * wear_added
+
+        # ==== Resource-based termination conditions ====
+        out_of_fuel = (self._fuel <= self.fuel_empty_threshold)
+        tires_gone = (self._wear >= self.wear_max_threshold)
+
+        if out_of_fuel:
+            terminated = True
+            if self._reward_shaping:
+                reward -= self.fuel_empty_penalty
+
+        if tires_gone:
+            terminated = True
+            if self._reward_shaping:
+                reward -= self.wear_max_penalty
+
+        # ==== Multi-lap logic ====
         # per-lap progress on the current track
         ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
 
@@ -194,6 +231,7 @@ class CarRacing(gym.Env):
             self._current_lap += 1
             info["lap_finished"] = True
             info["finished_lap"] = finished_lap
+            info["lap"] = self._current_lap
 
             # Reset underlying env to start the next lap
             observation, info_reset = self._env.reset()
@@ -260,6 +298,10 @@ class CarRacing(gym.Env):
         info["pit_executed"] = pit_executed
         info["ell"] = float(ell_t)
         info["d_t"] = float(d_t)
+        info["out_of_fuel"] = bool(out_of_fuel)
+        info["tires_gone"] = bool(tires_gone)
+        info["fuel"] = float(self._fuel)
+        info["wear"] = float(self._wear)
 
         # Update observation
         return self._get_obs(observation), reward, terminated, truncated, info
@@ -293,6 +335,8 @@ class CarRacing(gym.Env):
         # Base CarRacing expects only 3 controls, so we keep 'pit' separate
         if self.continuous:
             a = np.asarray(action, dtype=np.float32)
+            if a.shape[0] < 4:
+                a = np.concatenate([a, np.array([0.0], dtype=np.float32)], axis=0)
             steer = float(np.clip(a[0], -1.0, 1.0))
             gas   = float(np.clip(a[1],  0.0, 1.0))
             brake = float(np.clip(a[2],  0.0, 1.0))
@@ -705,3 +749,4 @@ class _GaugeWindow:
             self.window.close()
         except Exception:
             pass
+        

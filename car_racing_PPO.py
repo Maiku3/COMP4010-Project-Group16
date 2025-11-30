@@ -116,7 +116,7 @@ class PPOBuffer:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_low, action_high, log_std_init: float = -0.2):
+    def __init__(self, state_dim, action_low, action_high, log_std_init: float = -0.5):
         super().__init__()
 
         hidden = 256
@@ -146,9 +146,18 @@ class ActorCritic(nn.Module):
         self.register_buffer("action_scale", (high_t - low_t) / 2.0)
         self.register_buffer("action_bias", (high_t + low_t) / 2.0)
 
+        # Bias the initial policy toward sensible controls: steer=0, gas~0.6, brake=0, pit=0
+        with torch.no_grad():
+            bias = torch.zeros(action_dim)
+            target = torch.tensor([0.0, 0.6, 0.0, 0.0])
+            # Solve tanh(raw)= (target - bias)/scale
+            raw_target = torch.clamp((target - self.action_bias) / torch.clamp(self.action_scale, min=1e-6), -0.999, 0.999)
+            bias = torch.atanh(raw_target)
+            self.pi_net[-1].bias.copy_(bias)
+
     def _distribution(self, obs):
         mu = self.pi_net(obs)
-        std = torch.exp(self.log_std).clamp(1e-3, 1.5)
+        std = torch.exp(self.log_std).clamp(1e-3, 2.0)
         return Normal(mu, std)
 
     def _value(self, obs):
@@ -204,11 +213,11 @@ class PPOConfig:
     minibatch_size: int = 256
     target_kl: float = 0.02
     max_ep_len: int = 5000
-    entropy_coef: float = 0.03
-    entropy_coef_end: float = 0.005
+    entropy_coef: float = 0.12
+    entropy_coef_end: float = 0.03
     entropy_anneal: bool = True
-    reward_clip: float = 100.0
-    normalize_reward: bool = False
+    reward_clip: float = 200.0
+    normalize_reward: bool = True
     max_grad_norm: float = 0.5
     vf_clip_param: float = 0.2
     lr_anneal: bool = True
@@ -247,17 +256,17 @@ class PPOCarRacingAgent:
             lam=self.cfg.lam,
         )
 
-        # Reward shaping
-        self.progress_coef = 120.0
-        self.center_penalty = 0.1
-        self.offtrack_penalty = 8.0
+        # Reward shaping (drive forward, stay centered, finish laps)
+        self.progress_coef = 900.0
+        self.center_penalty = 0.05
+        self.offtrack_penalty = 2.5
         self.pit_bonus = 20.0
-        self.speed_target = 45.0
-        self.speed_coef = 0.15
-        self.heading_penalty = 2.5
-        self.lateral_penalty = 0.3
-        self.lap_bonus = 50.0
-        self.alive_bonus = 0.02
+        self.speed_target = 35.0
+        self.speed_coef = 0.70
+        self.heading_penalty = 0.05
+        self.lateral_penalty = 0.01
+        self.lap_bonus = 400.0
+        self.alive_bonus = 0.25
         self.prev_ell = 0.0
         self.current_entropy_coef = self.cfg.entropy_coef
 
@@ -435,8 +444,7 @@ class PPOCarRacingAgent:
                         episode_returns.append(ep_env_ret)
                         episode_env_returns.append(ep_env_ret)
                         print(
-                            f"[PPO] Ep {len(episode_returns)} | ep_len={ep_len} | shaped_return={ep_ret:.2f} "
-                            f"| env_return={ep_env_ret:.2f} | terminated={terminated} truncated={truncated}"
+                            f"[PPO] Ep {len(episode_returns)} | ep_len={ep_len} | return={ep_env_ret:.2f} | terminated={terminated} truncated={truncated}"
                         )
                         full_obs, _ = env.reset()
                         obs = self._obs_to_state(full_obs)
@@ -467,8 +475,8 @@ def make_env(render_mode=None, seed=0, max_episode_steps=5000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--steps-per-epoch", type=int, default=5000)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--steps-per-epoch", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=5000)
     parser.add_argument("--render", action="store_true")
