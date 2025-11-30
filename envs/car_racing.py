@@ -294,7 +294,7 @@ class CarRacing(gym.Env):
                 self._fuel = 1.0
                 self._wear = 0.0
                 pit_executed = True
-                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f} fuel={self._fuel:.3f} wear={self._wear:.3f}")
+                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f} fuel={fuel_before_service:.3f} wear={wear_before_service:.3f}")
 
         # Reward sensible pit-stops, mildly discourage pointless ones
         if self._reward_shaping and pit_executed:
