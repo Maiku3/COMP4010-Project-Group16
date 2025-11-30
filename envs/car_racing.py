@@ -34,9 +34,10 @@ class CarRacing(gym.Env):
         # State S_t
         image_space = spaces.Box(0, 255, shape=(96, 96, 3), dtype=np.uint8)
 
-        # state branch: [d_t, v_t, infield, pitroad, ell_t, w_t, f_t, kappa_t]
-        state_low  = np.array([-5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05], dtype=np.float32)
-        state_high = np.array([ 5.0, 70.0, 1.0, 1.0, 1.0, 1.0, 1.0,  0.05], dtype=np.float32)
+        # state branch: [d_t, v_t, infield, pitroad, ell_t, w_t, f_t, kappa_t, psi_t, v_lat]
+        # psi_t (heading error) and v_lat (lateral speed) help the agent keep orientation and stay centred.
+        state_low  = np.array([-5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.05, -math.pi, -20.0], dtype=np.float32)
+        state_high = np.array([ 5.0, 70.0, 1.0, 1.0, 1.0, 1.0, 1.0,  0.05,  math.pi,  20.0], dtype=np.float32)
         state_space = spaces.Box(low=state_low, high=state_high, dtype=np.float32)
 
         self.observation_space = spaces.Dict({"image": image_space, "state": state_space})
@@ -111,7 +112,7 @@ class CarRacing(gym.Env):
 
         # ==== How much wear impacts steering and gas ====
         self.steering_grip_min = 0.3      # min grip at wear=1.0 (30% of steering)
-        self.steering_wear_strength = 1 # 1.0 = full effect, < 1.0 = weaker effect
+        self.steering_wear_strength = 0.0 # 1.0 = full effect, < 1.0 = weaker effect
 
         # Multi-lap state
         self.max_laps = max(1, int(max_laps))
@@ -131,6 +132,7 @@ class CarRacing(gym.Env):
 
         # reset lap counter
         self._current_lap = 1
+        info["lap"] = self._current_lap
         info["max_laps"] = self.max_laps
 
         # build static painted pit strips onto the track
@@ -164,9 +166,8 @@ class CarRacing(gym.Env):
         velocity = self._get_velocity()
         # print(f"Velocity: {velocity:.2f} | Fuel: {self._fuel:.3f} | Wear: {self._wear:.3f}")
 
-        # ==== Resource updates (fuel + wear) ====
-        fuel_before = self._fuel
-        wear_before = self._wear
+        # Update resources
+        steer, gas, brake = float(base_action[0]), float(base_action[1]), float(base_action[2])
         
         # Scale effects by speed (0.3 at standstill to 1.0 at speed_ref and above)
         speed_scale = 0.3 + 0.7 * min(1.0, velocity / self.speed_ref_mps)
@@ -217,7 +218,12 @@ class CarRacing(gym.Env):
         info["lap"] = self._current_lap
         info["max_laps"] = self.max_laps
         info["lap_finished"] = False
+        info["finished_lap"] = None
         info["reset_for_new_lap"] = False
+
+        if lap_finished:
+            info["lap_finished"] = True
+            info["finished_lap"] = self._current_lap
 
         if lap_finished and self._current_lap < self.max_laps:
             # Finished a lap but not the whole race: start a new lap
@@ -226,7 +232,6 @@ class CarRacing(gym.Env):
             info["lap_finished"] = True
             info["finished_lap"] = finished_lap
             info["lap"] = self._current_lap
-
 
             # Reset underlying env to start the next lap
             observation, info_reset = self._env.reset()
@@ -271,7 +276,7 @@ class CarRacing(gym.Env):
             self._pit_lock_sector = None
 
         pit_executed = False
-        if pit_enter and pit_command and (velocity < self._pit_speed_max):
+        if pit_enter and (velocity < self._pit_speed_max):
             # only service if we haven't serviced this sector yet
             if self._pit_lock_sector is None or self._pit_lock_sector != sector_idx:
                 self._pit_lock_sector = sector_idx
@@ -280,22 +285,6 @@ class CarRacing(gym.Env):
                 pit_executed = True
                 print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
 
-        # Reward sensible pit-stops, mildly discourage pointless ones
-        if self._reward_shaping and pit_executed:
-            try:
-                fuel_before = info.get("fuel_before", None)
-                wear_before = info.get("wear_before", None)
-            except Exception:
-                fuel_before = None
-                wear_before = None
-
-            if (fuel_before is not None and fuel_before < 0.5) or (
-                wear_before is not None and wear_before > 0.5
-            ):
-                reward += 5.0   # “good” pit: it was actually needed
-            else:
-                reward -= 2.0   # pitting too early: small cost
-                
         # logs to check edges
         if pit_enter:
             print(f"[PIT] ENTER sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
@@ -362,8 +351,7 @@ class CarRacing(gym.Env):
             # Throttle (acceleration) also affected by grip
             gas *= grip
 
-            base = np.array([steer, gas, brake], dtype=np.float32)
-            return base, pit
+            return np.array([steer, gas, brake], dtype=np.float32), pit
         else:
             a = int(action)
             pit = (a == 5)
@@ -387,6 +375,11 @@ class CarRacing(gym.Env):
         v_t = self._get_velocity()
         ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
 
+        tile_idx = self._nearest_tile_index()
+        track_heading = self._track_heading(tile_idx)
+        heading_error = self._angle_diff(self._env.unwrapped.car.hull.angle, track_heading)
+        _, v_lat = self._velocity_components(track_heading)
+
         infield = self._is_infield_from_offset()
         pitroad = self._is_in_pit()
 
@@ -401,6 +394,8 @@ class CarRacing(gym.Env):
             float(np.clip(self._wear, 0.0, 1.0)), # w_t: tire wear
             float(np.clip(self._fuel, 0.0, 1.0)), # f_t: fuel level
             float(np.clip(kappa_t, -0.05, 0.05)), # kappa_t: track curvature
+            float(np.clip(heading_error, -math.pi, math.pi)), # psi_t: heading error vs track
+            float(np.clip(v_lat, -20.0, 20.0)), # v_lat: lateral speed relative to track
         ], dtype=np.float32)
 
         return {"image": base_obs, "state": state_vec}
@@ -523,6 +518,32 @@ class CarRacing(gym.Env):
         d = a - b
         # Wrap using atan2(sin, cos) for numerical stability
         return math.atan2(math.sin(d), math.cos(d))
+
+    def _track_heading(self, tile_idx: int | None = None) -> float:
+        """
+        Heading of the track centreline at the current tile, derived from the
+        direction between consecutive tile centres.
+        """
+        env = self._env.unwrapped
+        track = getattr(env, "track", None)
+        if not track or len(track) < 2:
+            return 0.0
+        if tile_idx is None:
+            tile_idx = self._nearest_tile_index()
+        n = len(track)
+        i_next = (tile_idx + 1) % n
+        _, _, cx0, cy0 = track[tile_idx]
+        _, _, cx1, cy1 = track[i_next]
+        return math.atan2(cy1 - cy0, cx1 - cx0)
+
+    def _velocity_components(self, track_heading: float):
+        """
+        Resolve car velocity into components aligned with the track heading.
+        """
+        vx, vy = float(self._env.unwrapped.car.hull.linearVelocity[0]), float(self._env.unwrapped.car.hull.linearVelocity[1])
+        v_long = vx * math.cos(track_heading) + vy * math.sin(track_heading)
+        v_lat = -vx * math.sin(track_heading) + vy * math.cos(track_heading)
+        return v_long, v_lat
     
     def _sector_state_by_index(self, tile_idx: int):
         """
@@ -728,4 +749,4 @@ class _GaugeWindow:
             self.window.close()
         except Exception:
             pass
-
+        
