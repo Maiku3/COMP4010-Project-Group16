@@ -19,7 +19,7 @@ class CarRacing(gym.Env):
         domain_randomize: bool = False,
         reward_shaping: bool = True,
         max_episode_steps: int = 3000,
-        max_laps: int = 1,
+        max_laps: int = 3,
     ):
         super(CarRacing, self).__init__()
         self._env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=continuous, lap_complete_percent=lap_complete_percent)
@@ -112,11 +112,12 @@ class CarRacing(gym.Env):
 
         # ==== How much wear impacts steering and gas ====
         self.steering_grip_min = 0.3      # min grip at wear=1.0 (30% of steering)
-        self.steering_wear_strength = 0.0 # 1.0 = full effect, < 1.0 = weaker effect
+        self.steering_wear_strength = 1.0 # 1.0 = full effect, < 1.0 = weaker effect
 
         # Multi-lap state
         self.max_laps = max(1, int(max_laps))
         self._current_lap = 1
+        self.race_completion_bonus = 50.0  # bonus reward for finishing all laps
 
     # reset()
     def reset(self, *, seed=None, options=None):
@@ -220,10 +221,14 @@ class CarRacing(gym.Env):
         info["lap_finished"] = False
         info["finished_lap"] = None
         info["reset_for_new_lap"] = False
+        info["race_finished"] = False
+
+        race_finished = False
 
         if lap_finished:
             info["lap_finished"] = True
             info["finished_lap"] = self._current_lap
+            race_finished = (self._current_lap >= self.max_laps)
 
         if lap_finished and self._current_lap < self.max_laps:
             # Finished a lap but not the whole race: start a new lap
@@ -255,6 +260,10 @@ class CarRacing(gym.Env):
             # Recompute progress on the fresh lap
             ell_t = self._env.unwrapped.tile_visited_count / len(self._env.unwrapped.track)
             info["reset_for_new_lap"] = True
+        elif race_finished:
+            info["race_finished"] = True
+            # One-time bonus for completing every lap in the race
+            reward += self.race_completion_bonus
         else:
             # Race progress across all laps [0,1]
             if self.max_laps > 0:
@@ -276,14 +285,30 @@ class CarRacing(gym.Env):
             self._pit_lock_sector = None
 
         pit_executed = False
-        if pit_enter and (velocity < self._pit_speed_max):
+        if pit_enter and pit_command and (velocity < self._pit_speed_max):
             # only service if we haven't serviced this sector yet
             if self._pit_lock_sector is None or self._pit_lock_sector != sector_idx:
                 self._pit_lock_sector = sector_idx
                 self._fuel = 1.0
                 self._wear = 0.0
                 pit_executed = True
-                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f}")
+                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f} fuel={self._fuel:.3f} wear={self._wear:.3f}")
+
+        # Reward sensible pit-stops, mildly discourage pointless ones
+        if self._reward_shaping and pit_executed:
+            try:
+                fuel_before = info.get("fuel_before", None)
+                wear_before = info.get("wear_before", None)
+            except Exception:
+                fuel_before = None
+                wear_before = None
+
+            if (fuel_before is not None and fuel_before < 0.5) or (
+                wear_before is not None and wear_before > 0.5
+            ):
+                reward += 5.0   # “good” pit: it was actually needed
+            else:
+                reward -= 2.0   # pitting too early: small cost
 
         # logs to check edges
         if pit_enter:

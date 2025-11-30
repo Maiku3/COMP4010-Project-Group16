@@ -416,6 +416,8 @@ def main():
         action="store_true",
         help="Use full discretized action grid instead of curated 13-action set",
     )
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints_dqn")
+    parser.add_argument("--save-every-episodes", type=int, default=50)
     args = parser.parse_args()
 
     # Generate a unique timestamp for the training run
