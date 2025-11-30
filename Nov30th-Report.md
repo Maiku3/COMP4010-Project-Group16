@@ -7,7 +7,7 @@
 
 * **Jaden Chang**: 
 
-* **Nicholas Nicolaev**: 
+* **Nicholas Nicolaev**: Implemented TD3 algorithm to compare to DQN and PPO results. Presented algorithm breakdown and results in demo video. [Pull Request #23](https://github.com/Maiku3/COMP4010-Project-Group16/pull/23)
 
 * **Ziyang Ling**: Modified DQN and PPO algorithms and train the agent. [Pull Request #18](https://github.com/Maiku3/COMP4010-Project-Group16/pull/18) [Pull Request #20](https://github.com/Maiku3/COMP4010-Project-Group16/pull/20) Helped create the env demo slides and video. 
 
