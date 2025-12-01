@@ -13,7 +13,7 @@
 
 * **Mike Lin**: 
   - Implemented several updates and fixes to the custom CarRacing environment like fuel and tire-wear to affect driving, and reward shaping. [Commit 93f88fa](https://github.com/Maiku3/COMP4010-Project-Group16/commit/93f88facb703ddc73d2017e001fcefc2a407c1e1) [Commit 8d546ed](https://github.com/Maiku3/COMP4010-Project-Group16/commit/8d546ede22d87320a298173e4f60faf980a6f08b)   - [Commit eebdbf2](https://github.com/Maiku3/COMP4010-Project-Group16/commit/eebdbf2bbb0ff59e9811e07fac5588be90dc666a)
-  - Added checkpoint saving to our algorithm training. [Commit 5a49160](https://github.com/Maiku3/COMP4010-Project-Group16/commit/5a4916059b78084de853f570126f6b2be1b35422)
+  - Added checkpoint saving to our algorithm training. [Commit a426210](https://github.com/Maiku3/COMP4010-Project-Group16/commit/a426210eee792ac28326cb2fe750415461ca75b4) [Commit 5a49160](https://github.com/Maiku3/COMP4010-Project-Group16/commit/5a4916059b78084de853f570126f6b2be1b35422)
   - Set up Colab notbook to help speed up training, and updated training scripts, added evaluation code. [Commit 034a94d](https://github.com/Maiku3/COMP4010-Project-Group16/commit/034a94d1005f93b913f136e4dab34b7068e60dac)
   - Utilized stablebaseline to test out more algorithms and generated plots/metrics. [Commit 2bb863f](https://github.com/Maiku3/COMP4010-Project-Group16/commit/2bb863f441540a6ac3b0fe6c806bacc920840724)
   - Helped with creation of demo video slides and assisted with architecture explanations and algorithm comparison analysis.
