@@ -5,7 +5,7 @@
 
 * **Hanyoung Chung**: Helped add a cnn method for PPO algorithm that takes in the image as well as the states to train the agent. [Pull Request #22](https://github.com/Maiku3/COMP4010-Project-Group16/pull/22). Helped created result demo video.
 
-* **Jaden Chang**: 
+* **Jaden Chang**: Implemented a CNN for the TD3 algorithm :[Pull Request #24](https://github.com/Maiku3/COMP4010-Project-Group16/pull/24). Also helped with creating and presenting the results demo video and presentation.
 
 * **Nicholas Nicolaev**: Implemented TD3 algorithm to compare to DQN and PPO results. Presented algorithm breakdown and results in demo video. [Pull Request #23](https://github.com/Maiku3/COMP4010-Project-Group16/pull/23)
 
