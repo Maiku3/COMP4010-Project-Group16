@@ -62,11 +62,11 @@ class CarRacing(gym.Env):
         # ===== Fuel (per second) ====== 
         # At idle: drains slowly, but at full gas: drains more (will need to adjust)
         self.fuel_base_per_s = 0.0015         # idle consumption
-        self.fuel_full_per_s = 0.0110         # extra at gas=1 (so total ~0.0125/s at speed)
+        self.fuel_full_per_s = 0.02         # extra at gas=1 (so total ~0.0125/s at speed)
 
         # Wear (per second)
-        self.wear_base_per_s = 0.0003         # always-on tiny wear
-        self.wear_brake_per_s = 0.0030        # additional at brake=1
+        self.wear_base_per_s = 0.003         # always-on tiny wear
+        self.wear_brake_per_s = 0.0050        # additional at brake=1
         self.wear_steer_per_s = 0.0020        # additional at steer=1
 
         # ===== Resource thresholds & shaping =====
@@ -294,7 +294,7 @@ class CarRacing(gym.Env):
                 self._fuel = 1.0
                 self._wear = 0.0
                 pit_executed = True
-                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f} fuel={fuel_before_service:.3f} wear={wear_before_service:.3f}")
+                print(f"[PIT] SERVICE at sector={sector_idx} ell={ell_t:.3f} d_t={d_t:+.2f} fuel_before={fuel_before_service:.3f} wear_before={wear_before_service:.3f}")
 
         # Reward sensible pit-stops, mildly discourage pointless ones
         if self._reward_shaping and pit_executed:
