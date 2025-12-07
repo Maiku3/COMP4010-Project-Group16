@@ -39,7 +39,7 @@ class ReplayBufferCNN:
     """
     Simple replay buffer that stores both state vector and raw image.
     """
-    def __init__(self, capacity: int = 100000):
+    def __init__(self, capacity: int = 30000):
         self.buffer = deque(maxlen=capacity)
 
     def push(self, state, image, action_idx, reward, next_state, next_image,
@@ -150,9 +150,9 @@ class DQNCarRacingCNNAgent:
         env: CarRacing,
         gamma: float = 0.99,
         lr: float = 1e-4,
-        batch_size: int = 64,
+        batch_size: int = 32,
         replay_capacity: int = 100000,
-        min_replay_size: int = 5000,
+        min_replay_size: int = 3000,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
         epsilon_decay_steps: int = 100000,
